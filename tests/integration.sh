@@ -56,7 +56,8 @@ database = 'mariadb' if stack == 'nginx' else 'mysql'
 
 def ci_run(argv, **kwargs):
     # Preserve the production subprocess contract. Only emit diagnostic output
-    # for known read-only checks, which contain no SQL or application secrets.
+    # for known checks/maintenance commands on this disposable fixture, which
+    # contain no SQL, credentials, or customer application data.
     kwargs.setdefault('text', True)
     kwargs.setdefault('capture_output', True)
     check = kwargs.pop('check', True)
@@ -65,7 +66,9 @@ def ci_run(argv, **kwargs):
     env.update(kwargs.pop('env', {}))
     result = subprocess.run(argv, env=env, check=False, **kwargs)
     if check and result.returncode:
-        safe = ('core' in argv and 'verify-checksums' in argv) or 'rewrite' in argv or argv[:2] in (
+        safe = ('core' in argv and 'verify-checksums' in argv) or any(
+            name in argv for name in ('rewrite', 'maintenance-mode', 'cache', 'search-replace')
+        ) or argv[:2] in (
             ['nginx', '-t'], ['apache2ctl', 'configtest'],
         )
         if safe:

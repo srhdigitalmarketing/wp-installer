@@ -141,6 +141,12 @@ class Manager:
 
     def wp(self, site, *args, **kwargs):
         cfg = self.config
+        # WP-CLI launches child commands (rewrite/db). www-data must be able
+        # to traverse their working directory, regardless of root's current cwd.
+        kwargs.setdefault('cwd', site['root'])
+        env = dict(kwargs.pop('env', {}))
+        env['WP_CLI_PHP'] = f'/usr/bin/php{cfg["php_version"]}'
+        kwargs['env'] = env
         command = ['runuser', '-u', 'www-data', '--', f'/usr/bin/php{cfg["php_version"]}',
                    WP, f'--path={site["root"]}', '--skip-plugins', '--skip-themes', *args]
         return self.runner(command, **kwargs)
