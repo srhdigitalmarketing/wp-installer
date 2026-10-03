@@ -287,6 +287,16 @@ class WebStack:
             if os.path.lexists(temporary):
                 os.unlink(temporary)
 
+    @staticmethod
+    def _link_targets(link: Path, target: Path, recorded: str) -> bool:
+        # Windows readlink may return a \\?\ namespace path for an ordinary
+        # C:\ path. Compare the actual files before the lexical fallback used
+        # for a managed dangling symlink on Linux.
+        try:
+            return os.path.samefile(link, target)
+        except OSError:
+            return Path(recorded).resolve() == target.resolve()
+
     def _activate(self, filename: str, content: str | None) -> None:
         """Rollback disk configuration if syntax checking or reloading fails."""
         self.available.mkdir(parents=True, exist_ok=True)
@@ -299,7 +309,7 @@ class WebStack:
         if previous is not None and not previous.startswith(HEADER.encode()):
             raise RuntimeError("Konfigurasi sudah ada tetapi bukan milik WPI.")
         old_link = os.readlink(link) if link.is_symlink() else None
-        if os.path.lexists(link) and (old_link is None or Path(old_link) != target):
+        if os.path.lexists(link) and (old_link is None or not self._link_targets(link, target, old_link)):
             raise RuntimeError("Sites-enabled berisi konfigurasi bukan milik WPI.")
         try:
             if content is None:

@@ -15,7 +15,8 @@ WPI mengatur server web, PHP-FPM, database, WordPress, virtual host, dan HTTPS.
   `utama.com/artikel?x=1`.
 - Ganti primary domain: backup terlebih dahulu, sesuaikan URL WordPress dan
   tautan di database menggunakan WP-CLI, terbitkan SSL untuk domain baru,
-  lalu ubah konfigurasi web. Domain lama dapat dilepas dari pengelolaan WPI.
+  lalu ubah konfigurasi web. Domain primary lama otomatis dilepas dari vhost
+  dan pengelolaan SSL WPI.
 - Pasang phpMyAdmin pada domain/subdomain tersendiri dengan HTTPS dan
   Basic Auth tambahan. Hapus phpMyAdmin hanya melepas antarmuka web tersebut;
   **database dan situs WordPress tetap ada**.
@@ -189,7 +190,7 @@ situs. Kredensial ini tampil hanya pada terminal root; simpan secara pribadi.
 | `/var/lib/wpi/` | Metadata stack, situs, domain, dan operasi WPI. |
 | `/var/lib/wpi/credentials/` | Kredensial pemulihan situs; hanya root. |
 | `/var/backups/wpi/` | Backup situs dan database. |
-| `/var/log/wpi/` | Log operasional. |
+| `/var/log/wpi/` | Direktori yang disiapkan; output SQL/kredensial tidak direkam. |
 
 Metadata dan backup hanya dapat dibaca root. Password database WordPress
 disimpan pada `wp-config.php` situs agar WordPress dapat tersambung ke database.

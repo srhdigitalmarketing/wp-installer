@@ -303,7 +303,8 @@ class Manager:
                f"GRANT ALL PRIVILEGES ON `{site['db_name']}`.* TO '{site['db_user']}'@'localhost';\n")
         self.runner(['mysql', '--protocol=socket', '-uroot'], input=sql)
         self.runner(['chown', '-R', 'www-data:www-data', str(Path(site['root']).parent)])
-        if not (Path(site['root']) / 'wp-load.php').exists():
+        intact = self.wp(site, 'core', 'verify-checksums', check=False)
+        if intact.returncode:
             self.wp(site, 'core', 'download', '--force')
         self.wp(site, 'core', 'verify-checksums')
         if not (Path(site['root']) / 'wp-config.php').exists():
@@ -486,6 +487,13 @@ class Manager:
             raise ValueError('Lokasi/identitas backup tidak cocok.')
         for host in [old['primary'], *old['secondary']]:
             self.ensure_free_domain(host, allow_site=current['id'])
+        root = Path(current['root'])
+        if root != WWW / current['id'] / 'public' or root.is_symlink():
+            raise ValueError('Lokasi WordPress tidak aman.')
+        staged = root.parent / 'restore-stage'
+        displaced = root.parent / ('previous-' + secrets.token_hex(4))
+        if staged.exists():
+            raise ValueError('Restore staging tersisa. Periksa dahulu.')
         safety = self.backup(identifier)
         # Removed domains lose their old certificates. Restore ACME routes and issue
         # missing certificates before putting the restored HTTPS URLs into service.
@@ -503,15 +511,8 @@ class Manager:
             except BaseException:
                 self.web.write_site(current)
                 raise
-        root = Path(current['root'])
-        if root != WWW / current['id'] / 'public' or root.is_symlink():
-            raise ValueError('Lokasi WordPress tidak aman.')
-        staged = root.parent / 'restore-stage'
-        displaced = root.parent / ('previous-' + secrets.token_hex(4))
-        if staged.exists():
-            raise ValueError('Restore staging tersisa. Periksa dahulu.')
-        staged.mkdir(mode=0o700)
         try:
+            staged.mkdir(mode=0o700)
             with tarfile.open(folder / 'files.tar.gz', 'r:gz') as archive:
                 members = archive.getmembers()
                 for member in members:

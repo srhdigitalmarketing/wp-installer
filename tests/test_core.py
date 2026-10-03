@@ -107,6 +107,13 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(self.manager.site(self.site["id"]), self.site)
         self.assertEqual(self.web.write_site.call_args.args[0], self.site)
 
+    def test_secondary_cancel_restores_configuration_and_state(self):
+        self.web.obtain_certificate.side_effect = KeyboardInterrupt()
+        with self.assertRaises(KeyboardInterrupt):
+            self.manager.add_secondary(self.site["id"], "alias.example.com")
+        self.assertEqual(self.manager.site(self.site["id"]), self.site)
+        self.assertEqual(self.web.write_site.call_args.args[0], self.site)
+
     def test_primary_replacement_uses_serialized_aware_search_and_detaches_old_domain(self):
         snapshot = self.base / "backup"
         with mock.patch.object(self.manager, "backup", return_value=snapshot):
@@ -166,6 +173,23 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(self.web.write_site.call_args.args[0], self.site)
         self.assertTrue(any("search-replace" in args for args, _ in self.commands))
 
+    def test_primary_change_cancel_after_mutation_rolls_back(self):
+        snapshot = self.base / "backup"
+        original_runner = self.manager.runner
+
+        def interrupted(argv, **kwargs):
+            if "search-replace" in argv:
+                raise KeyboardInterrupt()
+            return original_runner(argv, **kwargs)
+
+        self.manager.runner = interrupted
+        with mock.patch.object(self.manager, "backup", return_value=snapshot), \
+             mock.patch.object(self.manager, "restore_database") as restore:
+            with self.assertRaisesRegex(RuntimeError, "database dan konfigurasi dikembalikan"):
+                self.manager.change_primary(self.site["id"], "new.example.com")
+        restore.assert_called_once_with(self.site, snapshot)
+        self.assertEqual(self.manager.site(self.site["id"]), self.site)
+
     def test_failed_recovery_reports_backup_and_does_not_claim_success(self):
         snapshot = self.base / "backup"
         self.web.write_site.side_effect = RuntimeError("server unavailable")
@@ -206,6 +230,36 @@ class ManagerTests(unittest.TestCase):
         failed = self.manager.site("fresh.example.com")
         self.assertEqual(failed["status"], "incomplete")
         self.assertFalse(any("DROP DATABASE" in options.get("input", "") for _, options in self.commands))
+
+    def test_resume_repairs_partial_core_without_recreating_installed_wordpress(self):
+        self.site["status"] = "incomplete"
+        self.manager.save_site(self.site)
+        root = Path(self.site["root"])
+        root.mkdir(parents=True)
+        (root / "wp-load.php").write_text("partial-core")
+        (root / "wp-config.php").write_text("existing-config")
+        core.atomic_json(self.manager.data / "credentials" / (self.site["id"] + ".json"), {
+            "wordpress_password": "OriginalPassword123!", "database_password": "abc123" * 8,
+        })
+        runner = self.manager.runner
+        checks = 0
+
+        def partial_core(argv, **kwargs):
+            nonlocal checks
+            result = runner(argv, **kwargs)
+            if "verify-checksums" in argv:
+                checks += 1
+                if checks == 1:
+                    return subprocess.CompletedProcess(argv, 1, stdout="", stderr="missing files")
+            return result
+
+        self.manager.runner = partial_core
+        result, password = self.manager.resume_install(self.site["id"])
+        self.assertEqual(result["status"], "active")
+        self.assertEqual(password, "OriginalPassword123!")
+        self.assertTrue(any("download" in argv and "--force" in argv for argv, _ in self.commands))
+        self.assertFalse(any("install" in argv and "core" in argv for argv, _ in self.commands))
+        self.assertEqual((root / "wp-config.php").read_text(), "existing-config")
 
     def test_phpmyadmin_delete_never_invokes_sql_or_removes_a_package(self):
         cfg = self.manager.config
@@ -260,6 +314,55 @@ class ManagerTests(unittest.TestCase):
         (folder / "database.sql.gz").write_bytes(b"tampered")
         with self.assertRaisesRegex(ValueError, "Checksum"):
             self.manager.verified_backup(self.site, folder)
+
+    def test_restore_reissues_missing_primary_certificate_before_swapping_content(self):
+        root = Path(self.site["root"])
+        root.mkdir(parents=True)
+        (root / "index.php").write_text("old-content")
+        snapshot = self.manager.backup(self.site["id"])
+        current = {**self.site, "primary": "new.example.com", "tls": ["new.example.com"]}
+        self.manager.save_site(current)
+        (root / "index.php").write_text("current-content")
+        ready = {"new.example.com"}
+        self.web.certificate_ready.side_effect = lambda host: host in ready
+
+        def certificate(host, email, webroot):
+            self.assertEqual((root / "index.php").read_text(), "current-content")
+            ready.add(host)
+
+        self.web.obtain_certificate.side_effect = certificate
+        with mock.patch.object(self.manager, "restore_database") as database:
+            restored, safety = self.manager.restore(current["id"], snapshot)
+        self.assertEqual(restored["primary"], self.site["primary"])
+        self.assertIn(self.site["primary"], restored["tls"])
+        self.web.obtain_certificate.assert_called_once_with(self.site["primary"], self.site["email"], self.site["root"])
+        self.assertEqual((root / "index.php").read_text(), "old-content")
+        self.assertEqual(json.loads((safety / "site.json").read_text())["primary"], current["primary"])
+        database.assert_called_once_with(restored, snapshot.resolve())
+
+    def test_restore_certificate_failure_does_not_replace_files_or_database(self):
+        root = Path(self.site["root"])
+        root.mkdir(parents=True)
+        (root / "index.php").write_text("old-content")
+        snapshot = self.manager.backup(self.site["id"])
+        current = {**self.site, "primary": "new.example.com", "tls": ["new.example.com"]}
+        self.manager.save_site(current)
+        (root / "index.php").write_text("current-content")
+        self.web.certificate_ready.side_effect = lambda host: host == "new.example.com"
+        self.web.obtain_certificate.side_effect = RuntimeError("ACME unavailable")
+        with mock.patch.object(self.manager, "restore_database") as database:
+            with self.assertRaises(RuntimeError):
+                self.manager.restore(current["id"], snapshot)
+        self.assertEqual((root / "index.php").read_text(), "current-content")
+        self.assertEqual(self.manager.site(current["id"]), current)
+        self.assertEqual(self.web.write_site.call_args.args[0], current)
+        database.assert_not_called()
+
+    def test_existing_setup_cannot_switch_stack_or_database(self):
+        for stack, database in [("apache", "mariadb"), ("nginx", "mysql")]:
+            with self.subTest(stack=stack, database=database), self.assertRaises(ValueError):
+                self.manager.setup(stack, database)
+        self.assertEqual(self.commands, [])
 
     def test_restore_sql_is_not_world_readable(self):
         folder = self.base / "backup"

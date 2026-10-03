@@ -132,6 +132,7 @@ class WebActivationTests(unittest.TestCase):
             links = {}
             is_symlink, unlink = Path.is_symlink, Path.unlink
             readlink, lexists = os.readlink, os.path.lexists
+            samefile = os.path.samefile
 
             def virtual_unlink(path, *args, **kwargs):
                 if str(path) in links:
@@ -145,6 +146,7 @@ class WebActivationTests(unittest.TestCase):
                 patch.object(Path, "unlink", virtual_unlink),
                 patch("os.readlink", lambda path, **kw: links[str(path)] if str(path) in links else readlink(path, **kw)),
                 patch("os.path.lexists", lambda path: str(path) in links or lexists(path)),
+                patch("os.path.samefile", lambda first, second: samefile(links.get(str(first), first), links.get(str(second), second))),
             ]
             for patcher in self.patchers:
                 patcher.start()
@@ -158,7 +160,7 @@ class WebActivationTests(unittest.TestCase):
         self.web.write_site(SITE)
         target = self.web.available / f"wpi-{SITE['id']}.conf"
         self.assertTrue(target.read_text().startswith(HEADER))
-        self.assertEqual(os.readlink(self.web.enabled / target.name), str(target))
+        self.assertTrue(os.path.samefile(self.web.enabled / target.name, target))
         self.assertEqual([call.args[0] for call in self.runner.call_args_list],
                          [["nginx", "-t"], ["systemctl", "reload", "nginx"]])
 
@@ -204,6 +206,22 @@ class WebActivationTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.web.write_site(SITE)
         self.assertTrue(target.is_symlink())
+        self.runner.assert_not_called()
+
+    def test_enabled_symlink_to_other_file_is_rejected(self):
+        self.web.write_site(SITE)
+        target = self.web.available / f"wpi-{SITE['id']}.conf"
+        link = self.web.enabled / target.name
+        before = target.read_bytes()
+        link.unlink()
+        outside = self.base / "unmanaged.conf"
+        outside.write_text("# outside managed configuration\n")
+        link.symlink_to(outside)
+        self.runner.reset_mock()
+        with self.assertRaises(RuntimeError):
+            self.web.write_site({**SITE, "primary": "new.example.com"})
+        self.assertEqual(target.read_bytes(), before)
+        self.assertTrue(os.path.samefile(link, outside))
         self.runner.assert_not_called()
 
     def test_pma_remove_has_no_database_or_package_commands(self):

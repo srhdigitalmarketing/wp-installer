@@ -26,7 +26,7 @@ rm -rf -- /etc/nginx /etc/apache2 /etc/mysql /etc/phpmyadmin /etc/letsencrypt \
     /var/lib/mysql /var/www/wpi /var/lib/wpi /var/backups/wpi /etc/wpi
 
 export WPI_CI_STACK="$STACK"
-python3 - <<'PY'
+python3 -u - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -41,7 +41,29 @@ from wpi.web import WebStack
 
 stack = os.environ['WPI_CI_STACK']
 database = 'mariadb' if stack == 'nginx' else 'mysql'
-manager = core.Manager()
+
+def ci_run(argv, **kwargs):
+    # Preserve the production subprocess contract. Only emit diagnostic output
+    # for known read-only checks, which contain no SQL or application secrets.
+    kwargs.setdefault('text', True)
+    kwargs.setdefault('capture_output', True)
+    check = kwargs.pop('check', True)
+    env = os.environ.copy()
+    env.update({'DEBIAN_FRONTEND': 'noninteractive', 'LC_ALL': 'C.UTF-8'})
+    env.update(kwargs.pop('env', {}))
+    result = subprocess.run(argv, env=env, check=False, **kwargs)
+    if check and result.returncode:
+        safe = ('core' in argv and 'verify-checksums' in argv) or argv[:2] in (
+            ['nginx', '-t'], ['apache2ctl', 'configtest'],
+        )
+        if safe:
+            print('Safe CI diagnostic for verification command:', flush=True)
+            print(result.stdout or '', flush=True)
+            print(result.stderr or '', flush=True)
+        raise RuntimeError(f'CI command {Path(argv[0]).name} failed (exit {result.returncode}).')
+    return result
+
+manager = core.Manager(runner=ci_run)
 manager.setup(stack=stack, database=database)
 
 old = 'wpi-old.example.com'
