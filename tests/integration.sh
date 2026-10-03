@@ -31,6 +31,7 @@ WPI_BUNDLE="$(pwd)/dist/wp-installer-v${WPI_VERSION}.zip"
 read -r WPI_BUNDLE_SHA _ < "${WPI_BUNDLE}.sha256"
 bash install.sh --bundle "$WPI_BUNDLE" --sha256 "$WPI_BUNDLE_SHA"
 [[ "$(/usr/local/bin/wpi --version)" == "$WPI_VERSION" ]] || exit 1
+[[ "$(cat /usr/local/lib/wpi/VERSION)" == "v$WPI_VERSION" ]] || exit 1
 /usr/local/bin/wpi status
 /usr/local/bin/wpi list
 export WPI_CI_BUNDLE="$WPI_BUNDLE" WPI_CI_BUNDLE_SHA="$WPI_BUNDLE_SHA" WPI_CI_VERSION="$WPI_VERSION"
@@ -44,6 +45,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from unittest import mock
 
 # Run integration against the package actually installed by bootstrap.
@@ -121,10 +123,24 @@ def request(host, path='/', https=True, auth=False):
                 body.read_text(errors='replace') if body.exists() else '', response.returncode)
 
 def verify_redirect(host, target, https):
-    status, headers, _, code = request(host, '/article?x=1&y=2', https=https)
-    assert code == 0 and status == 301, (host, status, headers)
-    location = re.search(r'^location:\s*(.+?)\r?$', headers, re.I | re.M)
-    assert location and location[1].strip() == f'https://{target}/article?x=1&y=2', headers
+    # Nginx graceful reload acknowledges the signal before its new workers are
+    # ready. Retry the exact expected route for at most two seconds.
+    expected = f'https://{target}/article?x=1&y=2'
+    for _ in range(10):
+        status, headers, _, code = request(host, '/article?x=1&y=2', https=https)
+        location = re.search(r'^location:\s*(.+?)\r?$', headers, re.I | re.M)
+        if code == 0 and status == 301 and location and location[1].strip() == expected:
+            return
+        time.sleep(0.2)
+    raise AssertionError((host, status, headers))
+
+def expected_request(host, status, **kwargs):
+    for _ in range(10):
+        response = request(host, **kwargs)
+        if response[0] == status and response[3] == 0:
+            return response
+        time.sleep(0.2)
+    return response
 
 def verify_denied(host, https):
     status, headers, body, code = request(host, https=https)
@@ -135,7 +151,7 @@ with mock.patch.object(core, 'check_dns', return_value=None), \
      mock.patch.object(WebStack, 'obtain_certificate', local_certificate):
     site, _ = manager.install(old, 'owner@example.com', admin='ciadmin', password='CiWordPressPassword123!')
     manager.wp(site, 'core', 'is-installed')
-    status, _, body, code = request(old)
+    status, _, body, code = expected_request(old, 200)
     assert code == 0 and status == 200 and 'wp-content' in body, (status, body[:200])
     assert request(old, '/wp-config.php')[0] == 403
     verify_redirect(old, old, https=False)
@@ -173,7 +189,7 @@ with mock.patch.object(core, 'check_dns', return_value=None), \
     assert f'https://{new}/inside' in text and f'https://{old}/inside' not in text, text
     escaped = manager.wp(changed, 'option', 'get', 'wpi_ci_json_text').stdout.strip()
     assert escaped == '{"url":"https:\\/\\/' + new + '/escaped"}', escaped
-    assert request(new)[0] == 200
+    assert expected_request(new, 200)[0] == 200
     verify_redirect(alias, new, https=True)
     verify_denied(old, https=False)
     verify_denied(old, https=True)
@@ -186,12 +202,12 @@ with mock.patch.object(core, 'check_dns', return_value=None), \
     restored, _ = manager.restore(changed['id'], snapshot)
     assert restored['primary'] == old
     assert manager.wp(restored, 'option', 'get', 'siteurl').stdout.strip() == 'https://' + old
-    assert request(old)[0] == 200
+    assert expected_request(old, 200)[0] == 200
 
     tables_before = manager.wp(restored, 'db', 'tables', '--all-tables-with-prefix').stdout
     manager.install_pma(pma, 'owner@example.com', password='CiPanelPassword123!')
-    assert request(pma)[0] == 401  # Basic Auth precedes the phpMyAdmin cookie login.
-    status, _, body, _ = request(pma, auth=True)
+    assert expected_request(pma, 401)[0] == 401  # Basic Auth precedes the phpMyAdmin cookie login.
+    status, _, body, _ = expected_request(pma, 200, auth=True)
     assert status == 200 and 'phpMyAdmin' in body, (status, body[:200])
     verify_redirect(pma, pma, https=False)
     # Public ACME tokens bypass Basic Auth while normal UI remains protected.
@@ -215,6 +231,10 @@ with mock.patch.object(core, 'check_dns', return_value=None), \
     assert state_after == state_before, 'Application reinstall changed managed site state or credentials.'
     version = subprocess.run(['/usr/local/bin/wpi', '--version'], check=True, text=True, capture_output=True)
     assert version.stdout.strip() == os.environ['WPI_CI_VERSION']
+    release_path = Path('/usr/local/lib/wpi').resolve()
+    expected_version = 'v' + os.environ['WPI_CI_VERSION']
+    assert (release_path / 'VERSION').read_text().strip() == expected_version
+    assert release_path.name.startswith(expected_version + '.'), release_path.name
     subprocess.run(['/usr/local/bin/wpi', 'status'], check=True)
     listing = subprocess.run(['/usr/local/bin/wpi', 'list'], check=True, text=True, capture_output=True)
     assert old in listing.stdout, listing.stdout

@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 022
 
-VERSION="v1.0.0"
+WPI_VERSION="v1.0.0"
 REPOSITORY="srhdigitalmarketing/wp-installer"
 BUNDLE=""
 EXPECTED_SHA=""
@@ -47,7 +47,7 @@ while (($#)); do
         --version|--repo|--bundle|--sha256)
             (($# >= 2)) || fail "Nilai untuk $1 belum diisi."
             case "$1" in
-                --version) VERSION="$2" ;;
+                --version) WPI_VERSION="$2" ;;
                 --repo) REPOSITORY="$2" ;;
                 --bundle) BUNDLE="$2" ;;
                 --sha256) EXPECTED_SHA="${2,,}" ;;
@@ -60,7 +60,7 @@ while (($#)); do
     esac
 done
 
-[[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || fail "Tag versi tidak valid."
+[[ "$WPI_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || fail "Tag versi tidak valid."
 [[ "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "Repository harus berupa OWNER/REPO."
 [[ -z "$EXPECTED_SHA" || "$EXPECTED_SHA" =~ ^[0-9a-f]{64}$ ]] || fail "SHA256 harus 64 digit hex."
 
@@ -70,10 +70,16 @@ if ((CHECK_ONLY)); then
 else
     [[ "$EUID" -eq 0 ]] || fail "Jalankan dengan sudo atau sebagai root."
     [[ -r /etc/os-release ]] || fail "Sistem ini tidak memiliki /etc/os-release."
-    # shellcheck source=/dev/null
-    . /etc/os-release
-    [[ "${ID:-}" == "ubuntu" ]] || fail "Hanya Ubuntu yang didukung."
-    [[ "${VERSION_ID:-}" == "22.04" || "${VERSION_ID:-}" == "24.04" ]] || fail "Gunakan Ubuntu 22.04 atau 24.04 LTS."
+    # Source only in a subshell: os-release defines VERSION and other generic names.
+    WPI_OS_INFO="$(
+        # shellcheck source=/dev/null
+        . /etc/os-release
+        printf '%s\n%s' "${ID:-}" "${VERSION_ID:-}"
+    )"
+    WPI_OS_ID="${WPI_OS_INFO%%$'\n'*}"
+    WPI_OS_VERSION="${WPI_OS_INFO#*$'\n'}"
+    [[ "$WPI_OS_ID" == "ubuntu" ]] || fail "Hanya Ubuntu yang didukung."
+    [[ "$WPI_OS_VERSION" == "22.04" || "$WPI_OS_VERSION" == "24.04" ]] || fail "Gunakan Ubuntu 22.04 atau 24.04 LTS."
     command -v apt-get >/dev/null || fail "apt-get tidak ditemukan."
     missing=()
     command -v python3 >/dev/null || missing+=(python3)
@@ -88,7 +94,7 @@ fi
 
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' || fail "Python 3.10+ dibutuhkan."
 WORK="$(mktemp -d -t wpi-bootstrap.XXXXXXXX)"
-ASSET="wp-installer-${VERSION}.zip"
+ASSET="wp-installer-${WPI_VERSION}.zip"
 MANIFEST=""
 if [[ -n "$BUNDLE" ]]; then
     [[ -f "$BUNDLE" && ! -L "$BUNDLE" ]] || fail "Bundle lokal harus file ZIP biasa."
@@ -97,9 +103,9 @@ if [[ -n "$BUNDLE" ]]; then
         [[ -f "$MANIFEST" ]] || fail "Manifest $MANIFEST tidak ada; gunakan --sha256."
     fi
 else
-    BASE_URL="https://github.com/${REPOSITORY}/releases/download/${VERSION}"
+    BASE_URL="https://github.com/${REPOSITORY}/releases/download/${WPI_VERSION}"
     BUNDLE="$WORK/$ASSET"
-    printf 'Mengunduh WPI %s dari %s...\n' "$VERSION" "$REPOSITORY"
+    printf 'Mengunduh WPI %s dari %s...\n' "$WPI_VERSION" "$REPOSITORY"
     curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 3 \
         --connect-timeout 20 --max-time 300 \
         "$BASE_URL/$ASSET" --output "$BUNDLE"
@@ -204,9 +210,9 @@ done
 install -d -m 0755 /usr/local/lib /usr/local/bin "$RELEASES"
 install -d -m 0700 /var/lib/wpi /var/lib/wpi/sites /var/backups/wpi
 install -d -m 0750 /var/log/wpi
-STAGE="$(mktemp -d "$RELEASES/${VERSION}.XXXXXXXX")"
+STAGE="$(mktemp -d "$RELEASES/${WPI_VERSION}.XXXXXXXX")"
 cp -a -- "$WORK/extracted/." "$STAGE/"
-printf '%s\n' "$VERSION" > "$STAGE/VERSION"
+printf '%s\n' "$WPI_VERSION" > "$STAGE/VERSION"
 chmod 0755 "$STAGE"
 LAUNCHER_TEMP="$(mktemp /usr/local/bin/.wpi-launcher.XXXXXXXX)"
 cat > "$LAUNCHER_TEMP" <<'LAUNCHER'
@@ -223,5 +229,5 @@ mv -Tf -- "$NEXT" "$APP"
 STAGE="" # Installed releases remain available for rollback.
 mv -Tf -- "$LAUNCHER_TEMP" "$COMMAND"
 LAUNCHER_TEMP=""
-printf '\nWPI %s berhasil dipasang. Jalankan: sudo wpi\n' "$VERSION"
+printf '\nWPI %s berhasil dipasang. Jalankan: sudo wpi\n' "$WPI_VERSION"
 printf 'Data situs dipertahankan di /var/lib/wpi; backup di /var/backups/wpi.\n'
