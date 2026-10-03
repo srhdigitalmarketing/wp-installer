@@ -4,6 +4,10 @@ Panel terminal untuk memasang dan mengelola beberapa situs WordPress di Ubuntu.
 Jalankan `sudo wpi`, pilih nomor menu, lalu masukkan domain dan informasi situs.
 WPI mengatur server web, PHP-FPM, database, WordPress, virtual host, dan HTTPS.
 
+[Tonton / unduh video demo CLI (MP4, 1080p)](https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.0.0/WPI-demo-Indonesia.mp4)
+— 2 menit 22 detik, narasi Indonesia dan subtitle. Video menggunakan menu/prompt
+asli dengan backend simulasi serta domain contoh; tidak memasang VPS produksi.
+
 ## Fitur
 
 - Auto installer WordPress dengan pilihan **Nginx / Apache** dan
