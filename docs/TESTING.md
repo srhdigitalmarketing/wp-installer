@@ -41,6 +41,14 @@ Untuk PHP/FPM otomatis, periksa konfigurasi pool dan INI hasil pemasangan,
 layanan pemantauan lokal, timer aktif, serta informasi pada `sudo wpi status`.
 Pemasangan ulang pada stack yang sudah dikelola harus mengaktifkan controller
 tanpa mengganti database, situs, atau kredensial.
+
+Pengujian antrean memakai request HTTP yang benar-benar mengisi pool PHP,
+status FastCGI lokal, dan backlog socket Unix dari kernel. Keputusan kenaikan
+kapasitas memakai fixture RAM/CPU agar tetap deterministik di runner CI;
+konfigurasi pool yang baru kemudian benar-benar divalidasi, di-reload, dan
+diperiksa jumlah workernya. Hasil ini membuktikan jalur antrean hingga
+penerapan FPM, bukan ukuran kapasitas produksi atau pengukuran RAM/CPU beban
+nyata pada VPS pengguna.
 Domain uji diarahkan ke loopback dengan `curl --resolve`. Konfigurasi HTTPS
 diperiksa menggunakan sertifikat self-signed sementara. DNS publik dan penerbitan
 sertifikat ACME sengaja tidak dipanggil; hasil tes integrasi ini tidak membuktikan

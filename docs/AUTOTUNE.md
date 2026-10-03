@@ -37,6 +37,9 @@ Saat berjalan, controller memeriksa penggunaan memori proses PHP-FPM, jumlah
 worker aktif, antrean socket PHP di kernel, memori yang masih tersedia, dan
 penggunaan CPU. Antrean kernel dibaca langsung karena nilai antrean pada JSON
 status FPM tidak selalu menggambarkan backlog socket Unix.
+Jika antrean kernel tidak dapat dibaca, status menampilkan nilai tidak
+tersedia. Worker aktif yang penuh tetap dapat menunjukkan kebutuhan kenaikan,
+tetapi penurunan karena sepi memerlukan antrean kosong yang benar-benar terukur.
 Antrean yang meningkat dapat menaikkan batas worker jika anggaran memori dan
 kapasitas CPU masih memungkinkan. Kondisi sepi atau tekanan memori dapat
 menurunkan kapasitas. Pemakaian worker memakai sampel RSS, dengan perkiraan
@@ -49,8 +52,8 @@ perubahan biasa. Penurunan karena sepi menunggu 20 sampel, sekitar lima menit.
 Tekanan CPU, memori, swap, atau stall resource dapat menurunkan kapasitas
 lebih cepat pada kejadian pertama; penurunan berulang diberi jeda 180 detik.
 Controller juga memeriksa apakah memori cukup untuk penerapan konfigurasi
-baru. Jika memori
-sudah terlalu sedikit, perubahan ditunda dengan status `memory-exhausted`
+baru. Jika memori sudah terlalu sedikit, perubahan ditunda dengan status
+`memory-exhausted`
 agar reload tidak menambah tekanan memori. Jika telemetri tidak tersedia,
 controller menahan kenaikan dan menjaga batas konservatif. Jeda dan beberapa
 sampel mencegah reload pada setiap lonjakan singkat.
@@ -119,6 +122,10 @@ Menu **12 — Status dan diagnosis** menampilkan informasi yang sama. Perintah
 ini membaca status terakhir controller dan layanan, tanpa mengubah konfigurasi
 PHP/FPM. Gunakan status untuk melihat kapasitas yang dipilih, resource yang
 terdeteksi, serta alasan keputusan atau kegagalan terakhir.
+
+Jika anggaran memori bahkan lebih kecil daripada perkiraan satu worker,
+controller mempertahankan minimum satu worker dan melaporkan
+`memory-budget-exhausted`; kondisi ini tidak dianggap kapasitas sehat.
 
 Pengaturan otomatis tetap berjalan setelah pengguna menutup panel terminal
 dan setelah server dinyalakan ulang. Operasi WordPress lainnya tidak
