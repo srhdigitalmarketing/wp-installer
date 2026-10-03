@@ -27,6 +27,9 @@ sudo env CI=true WPI_DISPOSABLE_VM=1 bash tests/integration.sh apache
 Tes integrasi menguji server web, PHP-FPM, database, dan WordPress yang benar-benar
 berjalan, lalu memeriksa perubahan URL termasuk data option terserialisasi,
 redirect secondary 301, dan akses database sesudah UI phpMyAdmin dihapus.
+Bootstrap memasang bundle ZIP yang dibangun dari source dan menjalankan launcher
+terpasang. Setelah seluruh alur, pemasangan ulang aplikasi wajib mempertahankan
+seluruh metadata situs dan kredensial yang sama.
 Domain uji diarahkan ke loopback dengan `curl --resolve`. Konfigurasi HTTPS
 diperiksa menggunakan sertifikat self-signed sementara. DNS publik dan penerbitan
 sertifikat ACME sengaja tidak dipanggil; hasil tes integrasi ini tidak membuktikan

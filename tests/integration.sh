@@ -25,6 +25,15 @@ fi
 rm -rf -- /etc/nginx /etc/apache2 /etc/mysql /etc/phpmyadmin /etc/letsencrypt \
     /var/lib/mysql /var/www/wpi /var/lib/wpi /var/backups/wpi /etc/wpi
 
+python3 scripts/build_release.py
+WPI_VERSION="$(python3 -c 'from wpi import __version__; print(__version__)')"
+WPI_BUNDLE="$(pwd)/dist/wp-installer-v${WPI_VERSION}.zip"
+read -r WPI_BUNDLE_SHA _ < "${WPI_BUNDLE}.sha256"
+bash install.sh --bundle "$WPI_BUNDLE" --sha256 "$WPI_BUNDLE_SHA"
+[[ "$(/usr/local/bin/wpi --version)" == "$WPI_VERSION" ]] || exit 1
+/usr/local/bin/wpi status
+/usr/local/bin/wpi list
+export WPI_CI_BUNDLE="$WPI_BUNDLE" WPI_CI_BUNDLE_SHA="$WPI_BUNDLE_SHA" WPI_CI_VERSION="$WPI_VERSION"
 export WPI_CI_STACK="$STACK"
 python3 -u - <<'PY'
 import json
@@ -33,9 +42,12 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from unittest import mock
 
+# Run integration against the package actually installed by bootstrap.
+sys.path.insert(0, '/usr/local/lib/wpi')
 from wpi import core
 from wpi.web import WebStack
 
@@ -191,6 +203,18 @@ with mock.patch.object(core, 'check_dns', return_value=None), \
     verify_denied(pma, https=False)
     verify_denied(pma, https=True)
     manager.web.validate_reload()
+    state_before = {str(path.relative_to(manager.data)): path.read_bytes()
+                    for path in manager.data.rglob('*') if path.is_file()}
+    subprocess.run(['bash', 'install.sh', '--bundle', os.environ['WPI_CI_BUNDLE'],
+                    '--sha256', os.environ['WPI_CI_BUNDLE_SHA']], check=True)
+    state_after = {str(path.relative_to(manager.data)): path.read_bytes()
+                   for path in manager.data.rglob('*') if path.is_file()}
+    assert state_after == state_before, 'Application reinstall changed managed site state or credentials.'
+    version = subprocess.run(['/usr/local/bin/wpi', '--version'], check=True, text=True, capture_output=True)
+    assert version.stdout.strip() == os.environ['WPI_CI_VERSION']
+    subprocess.run(['/usr/local/bin/wpi', 'status'], check=True)
+    listing = subprocess.run(['/usr/local/bin/wpi', 'list'], check=True, text=True, capture_output=True)
+    assert old in listing.stdout, listing.stdout
     print(f'Integration passed: Ubuntu {manager.config["ubuntu"]}, {stack}, {database}, PHP {manager.config["php_version"]}.')
     print('TLS routing tested with self-signed certificates; public DNS/ACME issuance was not tested.')
 PY
