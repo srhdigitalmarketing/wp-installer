@@ -12,6 +12,13 @@ paket, mengubah database server, meminta sertifikat, atau menghapus berkas siste
 Tujuannya memeriksa batas input, domain yang sudah dipakai, redirect secondary,
 rollback pergantian primary, serta pemisahan penghapusan phpMyAdmin dari database.
 
+Untuk controller PHP/FPM, tes dengan data resource dan status FPM buatan dapat
+memeriksa keputusan tanpa membebani VPS. Cakupan yang diperlukan: pembatasan
+RAM/CPU container, perhitungan kapasitas awal, kenaikan ketika antrean bertambah,
+penahanan kenaikan saat CPU penuh, penurunan saat memori menipis, jeda antar
+reload, serta pemulihan konfigurasi setelah validasi/reload gagal. Data status
+yang tidak tersedia harus menghasilkan keputusan konservatif.
+
 ## Integrasi Ubuntu sekali pakai
 
 `tests/integration.sh` hanya boleh dijalankan di VM CI sekali pakai. Skrip ini
@@ -30,6 +37,10 @@ redirect secondary 301, dan akses database sesudah UI phpMyAdmin dihapus.
 Bootstrap memasang bundle ZIP yang dibangun dari source dan menjalankan launcher
 terpasang. Setelah seluruh alur, pemasangan ulang aplikasi wajib mempertahankan
 seluruh metadata situs dan kredensial yang sama.
+Untuk PHP/FPM otomatis, periksa konfigurasi pool dan INI hasil pemasangan,
+layanan pemantauan lokal, timer aktif, serta informasi pada `sudo wpi status`.
+Pemasangan ulang pada stack yang sudah dikelola harus mengaktifkan controller
+tanpa mengganti database, situs, atau kredensial.
 Domain uji diarahkan ke loopback dengan `curl --resolve`. Konfigurasi HTTPS
 diperiksa menggunakan sertifikat self-signed sementara. DNS publik dan penerbitan
 sertifikat ACME sengaja tidak dipanggil; hasil tes integrasi ini tidak membuktikan
@@ -52,6 +63,16 @@ perubahan domain.
 | phpMyAdmin | UI HTTPS menuntut Basic Auth sebelum halaman login database; kredensial panel tidak tampil pada daftar proses. |
 | Hapus phpMyAdmin | Hostname/UI tidak dapat dibuka; WordPress dan seluruh tabel/database masih tersedia. |
 | Backup/restore | Cadangkan, ubah sebuah post uji, restore, lalu periksa isi dan URL situs kembali benar. |
+| PHP/FPM otomatis | Resource server terbaca, konfigurasi PHP/FPM valid, pemantauan hanya dapat diakses lokal, timer aktif sesudah reboot, dan status menampilkan keputusan terakhir. |
+| Lonjakan request PHP | Gunakan beban PHP terkontrol pada VM uji; ketika antrean/worker sibuk meningkat dan masih ada resource, batas worker bertambah. Setelah beban turun, kapasitas kembali disesuaikan tanpa reload setiap sampel. |
+| Batas resource | Pada VM/container dengan batas RAM/CPU, target kapasitas mengikuti batas yang dihitung; tekanan memori menurunkan kapasitas jika reload aman dan CPU penuh menahan kenaikan. Headroom resource diperiksa sebelum penerapan konfigurasi. WordPress tetap dapat diakses setelah reload selesai. |
+| Pemulihan FPM | Simulasikan kegagalan validasi/reload di VM uji; konfigurasi sebelumnya dipulihkan, kegagalan tercatat tanpa kredensial, dan controller mencoba lagi pada siklus berikutnya. |
 
 Catat versi Ubuntu, stack, output pemeriksaan konfigurasi, status HTTP, dan hasil
 tes. Jangan memasukkan password, dump database, atau data pelanggan ke laporan.
+
+Bedakan hasil tes kebijakan dengan bukti beban nyata. Tes unit dengan metrik
+buatan membuktikan keputusan controller; integrasi membuktikan pemasangan dan
+operasi layanan. Keduanya belum membuktikan kapasitas trafik produksi atau
+hasil pada kombinasi tema/plugin tertentu. Catat tingkat request, RSS worker,
+antrean FPM, CPU, memori, perubahan batas worker, dan error HTTP dalam uji beban.

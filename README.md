@@ -12,6 +12,10 @@ asli dengan backend simulasi serta domain contoh; tidak memasang VPS produksi.
 
 - Auto installer WordPress dengan pilihan **Nginx / Apache** dan
   **MariaDB / MySQL**. Pilihan standar: Nginx + MariaDB.
+- Konfigurasi PHP dan PHP-FPM otomatis berdasarkan RAM/CPU yang tersedia,
+  termasuk batas resource container. Controller berkala memantau antrean PHP,
+  penggunaan worker, memori, dan beban CPU, lalu menyesuaikan kapasitas FPM
+  ketika diperlukan. Tidak perlu mengisi nilai PHP/FPM secara manual.
 - Beberapa situs, masing-masing memiliki direktori WordPress, database, dan
   akun database tersendiri.
 - Tambah secondary domain dengan redirect permanen **301** ke primary.
@@ -65,12 +69,12 @@ sudo apt-get update
 sudo apt-get install -y curl ca-certificates
 
 curl -fL --proto '=https' --proto-redir '=https' \
-  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.0.0/install.sh \
+  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.1.0/install.sh \
   -o install.sh
 curl -fL --proto '=https' --proto-redir '=https' \
-  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.0.0/install.sh.sha256 \
+  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.1.0/install.sh.sha256 \
   -o install.sh.sha256
-sha256sum --check install.sh.sha256 && sudo bash install.sh --version v1.0.0
+sha256sum --check install.sh.sha256 && sudo bash install.sh --version v1.1.0
 
 sudo wpi
 ```
@@ -83,25 +87,25 @@ percaya atau tinjau kode pada tag versi tersebut.
 
 ### Memakai bundle lokal
 
-Unduh `wp-installer-v1.0.0.zip` dan `wp-installer-v1.0.0.zip.sha256`
-dari [release v1.0.0](https://github.com/srhdigitalmarketing/wp-installer/releases/tag/v1.0.0),
+Unduh `wp-installer-v1.1.0.zip` dan `wp-installer-v1.1.0.zip.sha256`
+dari [release v1.1.0](https://github.com/srhdigitalmarketing/wp-installer/releases/tag/v1.1.0),
 lalu salin ke server bersama `install.sh`.
 
 ```bash
-sudo bash install.sh --bundle ./wp-installer-v1.0.0.zip
+sudo bash install.sh --bundle ./wp-installer-v1.1.0.zip
 sudo wpi
 ```
 
 Hash yang diperoleh secara terpisah juga dapat diberikan melalui `--sha256`:
 
 ```bash
-sudo bash install.sh --bundle ./wp-installer-v1.0.0.zip --sha256 HASH_SHA256_RILIS
+sudo bash install.sh --bundle ./wp-installer-v1.1.0.zip --sha256 HASH_SHA256_RILIS
 ```
 
 Validasi bundle tanpa pemasangan, tanpa akses root, dan tanpa jaringan:
 
 ```bash
-bash install.sh --bundle ./wp-installer-v1.0.0.zip --check-only
+bash install.sh --bundle ./wp-installer-v1.1.0.zip --check-only
 ```
 
 Mode ini memerlukan Bash dan Python 3.10+. SHA256, keamanan path ZIP, kelengkapan
@@ -197,6 +201,7 @@ situs. Kredensial ini tampil hanya pada terminal root; simpan secara pribadi.
 | `/usr/local/lib/wpi-releases/` | Versi aplikasi yang dipasang. |
 | `/var/lib/wpi/` | Metadata stack, situs, domain, dan operasi WPI. |
 | `/var/lib/wpi/credentials/` | Kredensial pemulihan situs; hanya root. |
+| `/var/lib/wpi/autotune/` | Status dan keputusan terakhir controller PHP/FPM; hanya root. |
 | `/var/backups/wpi/` | Backup situs dan database. |
 | `/var/log/wpi/` | Direktori yang disiapkan; output SQL/kredensial tidak direkam. |
 
@@ -207,7 +212,27 @@ terpisah yang aksesnya dibatasi. Log panel tidak mencatat password.
 
 Menjalankan bootstrap lagi mengganti aplikasi secara atomik dan mempertahankan
 data situs serta backup. Paket server dan konten WordPress dikelola terpisah
-dari pembaruan aplikasi WPI.
+dari pembaruan aplikasi WPI. Untuk memperbarui instalasi v1.0.0, jalankan ulang
+perintah instalasi v1.1.0 di atas. Pada stack WPI yang sudah selesai disiapkan,
+bootstrap otomatis mengaktifkan pengelolaan PHP/FPM tanpa menginstal ulang
+WordPress atau meminta pengaturan tambahan.
+
+## PHP dan FPM otomatis
+
+WPI menyiapkan konfigurasi awal dari resource server dan menjalankan controller
+setiap 15 detik. PHP-FPM juga otomatis membuat worker sesuai permintaan dalam
+batas yang dihitung controller. Saat antrean meningkat dan resource masih
+tersedia, kapasitas dapat bertambah; ketika penggunaan turun atau memori
+menipis, kapasitas disesuaikan kembali. Perubahan diperiksa sebelum reload.
+
+Jalankan `sudo wpi status` atau pilih menu **12** untuk melihat hasil pemantauan.
+Perintah status hanya membaca informasi, bukan mengubah konfigurasi. Detail
+cara kerja dan batas kapasitas tersedia di [PHP/FPM otomatis](docs/AUTOTUNE.md).
+
+Otomatisasi ini bekerja dalam RAM dan CPU server yang tersedia. Ketika CPU
+sudah penuh, menambah worker tidak mempercepat pemrosesan; controller menahan
+penambahan kapasitas. WPI tidak membeli VPS atau menambah resource cloud.
+Nilai memori PHP tidak dinaikkan tanpa batas hanya karena trafik bertambah.
 
 ## Pengembangan dan verifikasi
 

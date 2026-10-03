@@ -71,6 +71,30 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(manager.mock_calls, [mock.call.remove_pma()])
 
+    def test_background_autotune_runs_while_panel_operation_lock_is_occupied(self):
+        manager = mock.Mock()
+        manager.autotune_tick.return_value = {'enabled': True, 'max_children': 8}
+        with mock.patch.object(cli.sys, 'platform', 'linux'), \
+             mock.patch.object(cli.os, 'geteuid', return_value=0, create=True), \
+             mock.patch.object(cli, 'Manager', return_value=manager), \
+             mock.patch.object(cli, 'operation_lock', side_effect=ValueError('occupied')) as lock, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(['autotune-tick']), 0)
+        lock.assert_not_called()
+        manager.autotune_tick.assert_called_once_with()
+
+    def test_autotune_status_only_reads_controller_status(self):
+        manager = mock.Mock()
+        manager.autotune_status.return_value = {'enabled': True}
+        self.assertEqual(self.run_main(['autotune-status'], manager), 0)
+        self.assertEqual(manager.mock_calls, [mock.call.autotune_status()])
+
+    def test_autotune_upgrade_activation_has_no_interactive_prompt(self):
+        manager = mock.Mock()
+        manager.enable_autotune.return_value = {'enabled': True}
+        self.assertEqual(self.run_main(['autotune-enable'], manager), 0)
+        self.assertEqual(manager.mock_calls, [mock.call.enable_autotune()])
+
     def test_pma_delete_wrong_token_cancels_before_mutation(self):
         manager = mock.Mock()
         result = self.run_main(["pma-delete"], manager, "wrong")

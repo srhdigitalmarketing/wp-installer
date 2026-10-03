@@ -109,11 +109,15 @@ class WebStack:
                 "    }\n")
 
     def _nginx_php(self) -> str:
-        return ("    location ~ \\.php$ {\n"
+        return ("    client_max_body_size 320m;\n"
+                "    location = /wpi-fpm-status { return 403; }\n"
+                "    location ~ \\.php$ {\n"
                 "        try_files $uri =404;\n"
                 "        include fastcgi_params;\n"
                 "        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;\n"
                 "        fastcgi_param HTTPS $https if_not_empty;\n"
+                "        fastcgi_read_timeout 180s;\n"
+                "        fastcgi_send_timeout 180s;\n"
                 f"        fastcgi_pass unix:{self.socket};\n"
                 "    }\n")
 
@@ -133,7 +137,6 @@ class WebStack:
     def _nginx_wordpress(self, root: str) -> str:
         return (f"    root {root};\n"
                 "    index index.php index.html;\n"
-                "    client_max_body_size 64m;\n"
                 "    autoindex off;\n"
                 + self._nginx_acme(root)
                 + "    location ~* /wp-content/uploads/.*\\.(?:php[0-9]*|phtml|phar)(?:/|$) { deny all; }\n"
@@ -165,7 +168,12 @@ class WebStack:
                 "    </Location>\n")
 
     def _apache_php(self) -> str:
-        return ("    <FilesMatch \"\\.php$\">\n"
+        return ("    LimitRequestBody 335544320\n"
+                "    ProxyTimeout 180\n"
+                "    <LocationMatch \"^/wpi-fpm-status(?:/|$)\">\n"
+                "        Require all denied\n"
+                "    </LocationMatch>\n"
+                "    <FilesMatch \"\\.php$\">\n"
                 + f"        SetHandler \"proxy:unix:{self.socket}|fcgi://localhost/\"\n"
                 "    </FilesMatch>\n")
 

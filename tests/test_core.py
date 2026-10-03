@@ -364,6 +364,36 @@ class ManagerTests(unittest.TestCase):
                 self.manager.setup(stack, database)
         self.assertEqual(self.commands, [])
 
+    def test_existing_setup_automatically_migrates_php_fpm(self):
+        with mock.patch.object(self.manager, 'enable_autotune') as enable:
+            self.manager.setup('nginx', 'mariadb')
+        enable.assert_called_once_with()
+
+    def test_upgrade_installs_controller_preserving_site_and_database(self):
+        cfg = self.manager.config
+        cfg['phpmyadmin'] = {'domain': 'db.example.com'}
+        core.atomic_json(self.manager.data / 'config.json', cfg)
+        with mock.patch.object(core, 'AutoTuner') as tuner, \
+             mock.patch.object(core.shutil, 'which', return_value='/usr/bin/ss'):
+            tuner.return_value.install.return_value = {'enabled': True}
+            self.assertEqual(self.manager.enable_autotune(), {'enabled': True})
+        tuner.assert_called_once_with('8.3', self.runner, data_dir=self.manager.data)
+        self.assertTrue(self.manager.config['autotune_enabled'])
+        self.assertEqual(self.manager.site(self.site['id']), self.site)
+        self.web.write_site.assert_called_once_with(self.site)
+        self.web.install_phpmyadmin.assert_called_once_with(
+            'db.example.com', '/usr/share/phpmyadmin', '/etc/wpi/pma.htpasswd')
+        self.assertEqual(self.commands, [])
+
+    def test_incomplete_setup_does_not_enable_or_tick_controller(self):
+        cfg = self.manager.config
+        cfg['setup_complete'] = False
+        core.atomic_json(self.manager.data / 'config.json', cfg)
+        with mock.patch.object(core, 'AutoTuner') as tuner:
+            self.assertFalse(self.manager.enable_autotune()['enabled'])
+            self.assertFalse(self.manager.autotune_tick()['enabled'])
+        tuner.assert_not_called()
+
     def test_restore_sql_is_not_world_readable(self):
         folder = self.base / "backup"
         folder.mkdir()

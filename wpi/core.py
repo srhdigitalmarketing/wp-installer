@@ -19,6 +19,7 @@ import tempfile
 import urllib.request
 
 from .web import WebStack
+from .autotune import AutoTuner
 
 DATA = Path('/var/lib/wpi')
 BACKUPS = Path('/var/backups/wpi')
@@ -158,6 +159,8 @@ class Manager:
             if (self.config['stack'], self.config['database']) != (stack, database):
                 raise ValueError('Stack server sudah ditetapkan. Gunakan pilihan yang sama.')
             if self.config.get('setup_complete', True):
+                if not self.config.get('autotune_enabled'):
+                    self.enable_autotune()
                 return self.config
         release = dict(line.strip().split('=', 1) for line in Path('/etc/os-release').read_text().splitlines()
                        if '=' in line)
@@ -188,7 +191,7 @@ class Manager:
         print('Menginstal web server, PHP-FPM, database, Certbot, dan WP-CLI...')
         self.runner(['apt-get', 'update'])
         packages = [stack if stack == 'nginx' else 'apache2', f'{database}-server',
-                    'curl', 'ca-certificates', 'unzip', 'openssl', 'certbot', 'apache2-utils',
+                    'curl', 'ca-certificates', 'unzip', 'openssl', 'certbot', 'apache2-utils', 'iproute2',
                     f'php{php}-fpm', f'php{php}-cli', f'php{php}-mysql', f'php{php}-curl',
                     f'php{php}-gd', f'php{php}-mbstring', f'php{php}-xml', f'php{php}-zip',
                     f'php{php}-intl', f'php{php}-bcmath']
@@ -199,10 +202,9 @@ class Manager:
         db_conf.write_text('[mysqld]\nbind-address = 127.0.0.1\n', encoding='utf-8')
         self.runner(['systemctl', 'restart', db_service])
         self.runner(['systemctl', 'enable', '--now', db_service, f'php{php}-fpm'])
-        fpm_ini = Path(f'/etc/php/{php}/fpm/conf.d/99-wpi.ini')
-        fpm_ini.write_text('expose_php = Off\npost_max_size = 64M\nupload_max_filesize = 64M\n'
-                           'memory_limit = 256M\ncgi.fix_pathinfo = 0\n', encoding='utf-8')
-        self.runner(['systemctl', 'restart', f'php{php}-fpm'])
+        # Resource profiles and the running controller configure PHP/FPM without
+        # asking the user to enter process counts or PHP memory limits.
+        AutoTuner(php, self.runner, data_dir=self.data).install()
         if stack == 'apache':
             self.runner(['a2enmod', 'rewrite', 'proxy', 'proxy_fcgi', 'setenvif', 'ssl',
                          'auth_basic', 'authn_file', 'headers'])
@@ -226,8 +228,41 @@ class Manager:
         self.runner(['mysql', '--protocol=socket', '-uroot'], input=
                     "DROP USER IF EXISTS ''@'localhost';\nDROP DATABASE IF EXISTS test;\n")
         cfg['setup_complete'] = True
+        cfg['autotune_enabled'] = True
         atomic_json(self.data / 'config.json', cfg)
         return cfg
+
+    def enable_autotune(self):
+        cfg = self.config
+        if not cfg or not cfg.get('setup_complete', True):
+            return {'enabled': False, 'reason': 'Menunggu setup server selesai.'}
+        if not shutil.which('ss'):
+            self.runner(['apt-get', 'update'])
+            self.runner(['apt-get', 'install', '-y', '--no-install-recommends', 'iproute2'])
+        report = AutoTuner(cfg['php_version'], self.runner, data_dir=self.data).install()
+        # Update managed vhosts too so older installations inherit the new
+        # automatic upload ceiling and private status route protection.
+        web = self.web
+        for site in self.sites():
+            web.write_site(site)
+        pma = cfg.get('phpmyadmin')
+        if pma:
+            web.install_phpmyadmin(pma['domain'], '/usr/share/phpmyadmin', '/etc/wpi/pma.htpasswd')
+        cfg['autotune_enabled'] = True
+        atomic_json(self.data / 'config.json', cfg)
+        return report
+
+    def autotune_tick(self):
+        cfg = self.config
+        if not cfg or not cfg.get('setup_complete', True):
+            return {'enabled': False, 'reason': 'Menunggu setup server selesai.'}
+        return AutoTuner(cfg['php_version'], self.runner, data_dir=self.data).tick()
+
+    def autotune_status(self):
+        cfg = self.config
+        if not cfg or not cfg.get('autotune_enabled'):
+            return {'enabled': False, 'reason': 'Auto PHP-FPM belum diaktifkan.'}
+        return AutoTuner(cfg['php_version'], self.runner, data_dir=self.data).status()
 
     def install(self, host, email, title='WordPress', admin='admin', password=None):
         host = self.ensure_free_domain(host)
@@ -652,9 +687,40 @@ class Manager:
         lines = []
         for service in ('nginx' if cfg['stack'] == 'nginx' else 'apache2',
                         'mariadb' if cfg['database'] == 'mariadb' else 'mysql',
-                        f'php{cfg["php_version"]}-fpm', 'certbot.timer'):
+                        f'php{cfg["php_version"]}-fpm', 'certbot.timer', 'wpi-autotune.timer'):
             result = self.runner(['systemctl', 'is-active', service], check=False)
             lines.append(f'{service}: {"aktif" if result.returncode == 0 else "PERLU DIPERIKSA"}')
+        report = self.autotune_status()
+        if report.get('enabled') and 'children' in report:
+            reasons = {'initial': 'konfigurasi awal', 'stable': 'stabil',
+                       'sustained-demand': 'kapasitas naik mengikuti antrean',
+                       'idle': 'kapasitas turun karena sepi',
+                       'resource-pressure': 'kapasitas turun karena tekanan resource',
+                       'capacity-limit': 'mengikuti batas kapasitas server',
+                       'hardware-bound': 'mencapai batas RAM/CPU',
+                       'telemetry-unavailable': 'menunggu telemetri',
+                       'rss-unavailable': 'menunggu sampel memori worker',
+                       'pressure-cooldown': 'menunggu setelah penurunan kapasitas',
+                       'memory-exhausted': 'menunggu ruang RAM untuk perubahan yang aman',
+                       'reload-pending': 'menunggu request berjalan selesai sebelum konfigurasi baru aktif',
+                       'reload-failed': 'perubahan gagal; konfigurasi dipulihkan'}
+            lines.append(f'Auto PHP-FPM: worker maksimum {report["children"]}; '
+                         f'batas kapasitas {report.get("capacity", "?")}; '
+                         f'antrean {report.get("queue") if report.get("queue") is not None else "?"}; '
+                         f'CPU {report.get("cpu_percent") if report.get("cpu_percent") is not None else "?"}%.')
+            lines.append('Keputusan otomatis: ' + reasons.get(report.get('reason'), str(report.get('reason'))))
+            if report.get('reload_pending'):
+                lines.append('Reload PHP-FPM sedang menunggu request berjalan selesai.')
+            limits = report.get('profile', {})
+            lines.append(f'Profil PHP: memori {limits.get("memory_mib", "?")} MB; '
+                         f'upload {limits.get("upload_mib", "?")} MB; '
+                         f'RAM tersedia {report.get("memory_available_mib", "?")} MB.')
+            updated = report.get('updated_at', 0)
+            age = dt.datetime.now(dt.timezone.utc).timestamp() - updated
+            if age > 90:
+                lines.append('Telemetri PHP-FPM belum diperbarui lebih dari 90 detik; periksa layanan autotune.')
+        else:
+            lines.append('Auto PHP-FPM: ' + str(report.get('reason', 'belum tersedia')))
         for site in self.sites():
             result = self.wp(site, 'core', 'is-installed', check=False)
             lines.append(f'{site["primary"]}: {site["status"]}; WordPress '

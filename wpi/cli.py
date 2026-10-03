@@ -2,6 +2,7 @@
 import argparse
 import contextlib
 import getpass
+import json
 import os
 from pathlib import Path
 import sys
@@ -193,6 +194,9 @@ def parser():
     commands.add_parser('menu')
     commands.add_parser('list')
     commands.add_parser('status')
+    commands.add_parser('autotune-enable', help='Aktivasi otomatis saat upgrade instalasi WPI.')
+    commands.add_parser('autotune-tick', help='Perintah internal timer PHP-FPM.')
+    commands.add_parser('autotune-status', help='Lihat kapasitas dan keputusan PHP-FPM otomatis.')
     setup = commands.add_parser('setup')
     setup.add_argument('--stack', choices=['nginx', 'apache'], default='nginx')
     setup.add_argument('--database', choices=['mariadb', 'mysql'], default='mariadb')
@@ -221,12 +225,22 @@ def main(argv=None):
         return 1
     manager = Manager()
     try:
+        # A terminal menu can stay open for hours. The background controller
+        # has its own lock and must keep scaling while the user views the panel.
+        if args.command == 'autotune-tick':
+            print(json.dumps(manager.autotune_tick(), ensure_ascii=False, sort_keys=True))
+            return 0
+        if args.command == 'autotune-status':
+            print(json.dumps(manager.autotune_status(), ensure_ascii=False, sort_keys=True))
+            return 0
         with operation_lock():
             command = args.command or 'menu'
             if command == 'menu':
                 menu(manager)
             elif command == 'setup':
                 manager.setup(args.stack, args.database)
+            elif command == 'autotune-enable':
+                print(json.dumps(manager.enable_autotune(), ensure_ascii=False, sort_keys=True))
             elif command == 'list':
                 show_sites(manager)
             elif command == 'status':

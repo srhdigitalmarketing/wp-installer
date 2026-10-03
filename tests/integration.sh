@@ -39,6 +39,7 @@ export WPI_CI_STACK="$STACK"
 python3 -u - <<'PY'
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import re
 import shutil
@@ -50,7 +51,7 @@ from unittest import mock
 
 # Run integration against the package actually installed by bootstrap.
 sys.path.insert(0, '/usr/local/lib/wpi')
-from wpi import core
+from wpi import core, autotune
 from wpi.web import WebStack
 
 stack = os.environ['WPI_CI_STACK']
@@ -82,6 +83,25 @@ def ci_run(argv, **kwargs):
 
 manager = core.Manager(runner=ci_run)
 manager.setup(stack=stack, database=database)
+
+# The controller is enabled by initial stack setup, without a settings step.
+for action in ('is-enabled', 'is-active'):
+    subprocess.run(['systemctl', action, '--quiet', 'wpi-autotune.timer'], check=True)
+tuner = autotune.AutoTuner(manager.config['php_version'], ci_run, data_dir=manager.data)
+assert tuner.status_socket.parent.stat().st_mode & 0o777 == 0o700
+for attempt in range(25):
+    try:
+        fpm_status = autotune.read_fpm_status(tuner.status_socket)
+        break
+    except (OSError, ValueError, RuntimeError):
+        if attempt == 24:
+            raise
+        time.sleep(0.2)
+assert fpm_status['pool'] == 'www', fpm_status
+assert fpm_status['total processes'] >= 1, fpm_status
+# This invokes the installed systemd unit, not a unit-test runner/mocked socket.
+subprocess.run(['systemctl', 'start', 'wpi-autotune.service'], check=True)
+assert tuner.status(), 'The automatic controller did not publish a status report.'
 
 old = 'wpi-old.example.com'
 new = 'wpi-new.example.com'
@@ -147,6 +167,87 @@ def verify_denied(host, https):
     assert status in (0, 403, 404, 410, 421) and 'wp-content' not in body, (status, headers)
     assert code in (0, 52, 56), code  # Nginx 444 closes the socket without an HTTP response.
 
+def verify_real_fpm_congestion(site):
+    """Real queued HTTP requests + real validated FPM growth.
+
+    Only the RAM/CPU headroom and elapsed policy clock are deterministic
+    fixtures. The web requests, private FastCGI status and FPM reload are real.
+    This avoids treating a busy shared CI runner as stable production capacity.
+    """
+    subprocess.run(['systemctl', 'stop', 'wpi-autotune.timer'], check=True)
+    slow = Path(site['root']) / 'wpi-ci-slow.php'
+    try:
+        with tuner._lock(blocking=True):
+            old_children = tuner._state()['children']
+            actual_resources = autotune.detect_resources()
+            tuner._apply(2, actual_resources, update_ini=False)
+            time.sleep(1)
+            slow.write_text('<?php usleep(8000000); echo "wpi-ci-slow"; ?>', encoding='utf-8')
+            slow.chmod(0o644)
+            fixture = {
+                **actual_resources,
+                'memory_total': 8 * autotune.GIB,
+                'memory_available': 6 * autotune.GIB,
+                'cpus': 4.0, 'host_cpus': 4, 'cpu_load': 0.10,
+                'memory_psi': 0.0, 'swap_delta': 0,
+                'worker_rss': [64 * autotune.MIB], 'telemetry_ok': True,
+            }
+            state = {'children': 2, 'last_change': 0, 'saturation_ticks': 0,
+                     'idle_ticks': 0, 'pressure_ticks': 0}
+            try:
+                with ThreadPoolExecutor(max_workers=6) as requests:
+                    futures = [requests.submit(request, site['primary'], '/wpi-ci-slow.php')
+                               for _ in range(6)]
+                    # An independent status listener must remain responsive
+                    # while both website workers are occupied and requests queue.
+                    deadline = time.monotonic() + 5
+                    maximum_queue, decision = 0, None
+                    iteration = 0
+                    while time.monotonic() < deadline:
+                        status = autotune.read_fpm_status(tuner.status_socket)
+                        # Native FPM JSON does not measure UNIX-listener queues.
+                        # Read the actual kernel backlog using production code.
+                        queue = autotune.read_socket_queue(
+                            ci_run, Path(f'/run/php/php{manager.config["php_version"]}-fpm.sock'))
+                        assert queue is not None, 'The UNIX listen queue could not be measured.'
+                        status['listen queue'] = queue
+                        status['queue_measured'] = True
+                        maximum_queue = max(maximum_queue, status['listen queue'])
+                        decision = autotune.decide(fixture, status, state, 1000 + iteration * 15)
+                        state.update(decision)
+                        if decision['children'] > 2:
+                            break
+                        iteration += 1
+                        time.sleep(0.2)
+                    assert maximum_queue > 0, 'Real FPM congestion did not expose a listen queue.'
+                    assert decision and decision['children'] > 2, decision
+                    grown = decision['children']
+                    tuner._apply(grown, actual_resources, update_ini=False)
+                    assert f'pm.max_children = {grown}\n' in tuner.pool.read_text()
+                    # Graceful reload may wait for old sleeping requests to
+                    # finish before new workers start. Wait within curl's bound.
+                    deadline = time.monotonic() + 20
+                    observed = 0
+                    while time.monotonic() < deadline:
+                        try:
+                            observed = autotune.read_fpm_status(tuner.status_socket)['total processes']
+                            if observed >= grown:
+                                break
+                        except (OSError, RuntimeError, ValueError):
+                            pass
+                        time.sleep(0.2)
+                    assert observed >= grown, (grown, observed)
+                    for future in futures:
+                        status, _, body, code = future.result()
+                        assert status == 200 and code == 0 and body == 'wpi-ci-slow', (status, code)
+                print(f'Real FPM queue {maximum_queue}; workers grew 2 -> {grown}. '
+                      'Policy RAM/CPU headroom and clock were injected CI fixtures.', flush=True)
+            finally:
+                tuner._apply(old_children, actual_resources, update_ini=False)
+    finally:
+        slow.unlink(missing_ok=True)
+        subprocess.run(['systemctl', 'start', 'wpi-autotune.timer'], check=True)
+
 with mock.patch.object(core, 'check_dns', return_value=None), \
      mock.patch.object(WebStack, 'obtain_certificate', local_certificate):
     site, _ = manager.install(old, 'owner@example.com', admin='ciadmin', password='CiWordPressPassword123!')
@@ -154,7 +255,9 @@ with mock.patch.object(core, 'check_dns', return_value=None), \
     status, _, body, code = expected_request(old, 200)
     assert code == 0 and status == 200 and 'wp-content' in body, (status, body[:200])
     assert request(old, '/wp-config.php')[0] == 403
+    assert request(old, autotune.STATUS_PATH)[0] == 403
     verify_redirect(old, old, https=False)
+    verify_real_fpm_congestion(site)
 
     # A PHP array option is stored serialized by WordPress. The replacement
     # must retain its structure while changing all canonical URL variants.
@@ -209,6 +312,7 @@ with mock.patch.object(core, 'check_dns', return_value=None), \
     assert expected_request(pma, 401)[0] == 401  # Basic Auth precedes the phpMyAdmin cookie login.
     status, _, body, _ = expected_request(pma, 200, auth=True)
     assert status == 200 and 'phpMyAdmin' in body, (status, body[:200])
+    assert request(pma, autotune.STATUS_PATH, auth=True)[0] == 403
     verify_redirect(pma, pma, https=False)
     # Public ACME tokens bypass Basic Auth while normal UI remains protected.
     pma_acme = core.WWW / 'pma-acme' / '.well-known' / 'acme-challenge' / 'wpi-pma-token'
@@ -222,12 +326,16 @@ with mock.patch.object(core, 'check_dns', return_value=None), \
     verify_denied(pma, https=False)
     verify_denied(pma, https=True)
     manager.web.validate_reload()
-    state_before = {str(path.relative_to(manager.data)): path.read_bytes()
-                    for path in manager.data.rglob('*') if path.is_file()}
+    # Controller telemetry is expected to change every 15 seconds. Site state,
+    # credentials and all other managed data must remain byte-for-byte intact.
+    def persistent_state():
+        return {str(path.relative_to(manager.data)): path.read_bytes()
+                for path in manager.data.rglob('*') if path.is_file()
+                and path.relative_to(manager.data).parts[0] != 'autotune'}
+    state_before = persistent_state()
     subprocess.run(['bash', 'install.sh', '--bundle', os.environ['WPI_CI_BUNDLE'],
                     '--sha256', os.environ['WPI_CI_BUNDLE_SHA']], check=True)
-    state_after = {str(path.relative_to(manager.data)): path.read_bytes()
-                   for path in manager.data.rglob('*') if path.is_file()}
+    state_after = persistent_state()
     assert state_after == state_before, 'Application reinstall changed managed site state or credentials.'
     version = subprocess.run(['/usr/local/bin/wpi', '--version'], check=True, text=True, capture_output=True)
     assert version.stdout.strip() == os.environ['WPI_CI_VERSION']
@@ -235,7 +343,13 @@ with mock.patch.object(core, 'check_dns', return_value=None), \
     expected_version = 'v' + os.environ['WPI_CI_VERSION']
     assert (release_path / 'VERSION').read_text().strip() == expected_version
     assert release_path.name.startswith(expected_version + '.'), release_path.name
-    subprocess.run(['/usr/local/bin/wpi', 'status'], check=True)
+    general_status = subprocess.run(['/usr/local/bin/wpi', 'status'], check=True,
+                                    text=True, capture_output=True)
+    assert 'autotune' in general_status.stdout.lower(), general_status.stdout
+    tuning_status = subprocess.run(['/usr/local/bin/wpi', 'autotune-status'], check=True,
+                                   text=True, capture_output=True)
+    assert tuning_status.stdout.strip(), 'CLI autotune status is empty.'
+    assert tuner.status()['enabled'] is True
     listing = subprocess.run(['/usr/local/bin/wpi', 'list'], check=True, text=True, capture_output=True)
     assert old in listing.stdout, listing.stdout
     print(f'Integration passed: Ubuntu {manager.config["ubuntu"]}, {stack}, {database}, PHP {manager.config["php_version"]}.')

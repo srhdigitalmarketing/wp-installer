@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 022
 
-WPI_VERSION="v1.0.0"
+WPI_VERSION="v1.1.0"
 REPOSITORY="srhdigitalmarketing/wp-installer"
 BUNDLE=""
 EXPECTED_SHA=""
@@ -16,12 +16,12 @@ usage() {
     cat <<'HELP'
 WPI bootstrap untuk Ubuntu 22.04 / 24.04 LTS
 
-  sudo bash install.sh [--version v1.0.0] [--repo OWNER/REPO]
-  sudo bash install.sh --bundle ./wp-installer-v1.0.0.zip --sha256 SHA256
-  bash install.sh --bundle ./wp-installer-v1.0.0.zip --sha256 SHA256 --check-only
+  sudo bash install.sh [--version v1.1.0] [--repo OWNER/REPO]
+  sudo bash install.sh --bundle ./wp-installer-v1.1.0.zip --sha256 SHA256
+  bash install.sh --bundle ./wp-installer-v1.1.0.zip --sha256 SHA256 --check-only
 
 Pilihan:
-  --version TAG   Release GitHub yang dipasang (default: v1.0.0).
+  --version TAG   Release GitHub yang dipasang (default: v1.1.0).
   --repo REPO     Repository GitHub publik OWNER/REPO.
   --bundle FILE   Gunakan ZIP lokal tanpa mengunduh bundle.
   --sha256 HASH   SHA256 tepercaya; jika kosong, gunakan manifest release.
@@ -229,5 +229,10 @@ mv -Tf -- "$NEXT" "$APP"
 STAGE="" # Installed releases remain available for rollback.
 mv -Tf -- "$LAUNCHER_TEMP" "$COMMAND"
 LAUNCHER_TEMP=""
+# Upgrade an existing managed server automatically; fresh servers activate this
+# during their first setup. Older bundles remain usable for application rollback.
+if [[ -f "$APP/wpi/autotune.py" && -f /var/lib/wpi/config.json ]]; then
+    "$COMMAND" autotune-enable
+fi
 printf '\nWPI %s berhasil dipasang. Jalankan: sudo wpi\n' "$WPI_VERSION"
 printf 'Data situs dipertahankan di /var/lib/wpi; backup di /var/backups/wpi.\n'

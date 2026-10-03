@@ -20,6 +20,15 @@ class WebRenderTests(unittest.TestCase):
     def stack(self, stack="nginx"):
         return WebStack(Mock(), stack, "8.3")
 
+    def test_fpm_status_endpoint_is_private_for_wordpress_and_phpmyadmin(self):
+        for name in ('nginx', 'apache'):
+            web = self.stack(name)
+            with self.subTest(stack=name), patch.object(web, 'certificate_ready', return_value=True):
+                for content in (web.render_site(SITE), web.render_phpmyadmin(
+                        'db.example.com', '/usr/share/phpmyadmin', '/etc/wpi/pma.htpasswd')):
+                    self.assertIn('/wpi-fpm-status', content)
+                    self.assertIn('return 403' if name == 'nginx' else 'Require all denied', content)
+
     def test_nginx_http_permalink_php_and_upload_protection(self):
         result = self.stack().render_site(SITE)
         self.assertIn("try_files $uri $uri/ /index.php?$args", result)
