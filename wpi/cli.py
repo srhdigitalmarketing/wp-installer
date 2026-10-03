@@ -1,0 +1,273 @@
+"""Interactive terminal panel and scriptable command entry points."""
+import argparse
+import contextlib
+import getpass
+import os
+from pathlib import Path
+import sys
+
+from . import __version__
+from .core import Manager, DATA
+
+
+def ask(label, default=None):
+    suffix = f' [{default}]' if default is not None else ''
+    answer = input(label + suffix + ': ').strip()
+    if not answer and default is not None:
+        return default
+    if not answer:
+        raise ValueError(label + ' wajib diisi.')
+    return answer
+
+
+def password_prompt():
+    password = getpass.getpass('Password (Enter = otomatis): ')
+    if not password:
+        return None
+    if password != getpass.getpass('Ulangi password: '):
+        raise ValueError('Password tidak cocok.')
+    return password
+
+
+def show_sites(manager):
+    sites = manager.sites()
+    if not sites:
+        print('Belum ada situs.')
+    for site in sites:
+        print(f'{site["id"]}  {site["primary"]}  [{site["status"]}]')
+        if site['secondary']:
+            print('              Secondary -> 301: ' + ', '.join(site['secondary']))
+    return sites
+
+
+def select_site(manager):
+    sites = show_sites(manager)
+    if not sites:
+        raise ValueError('Install WordPress terlebih dahulu.')
+    default = sites[0]['primary'] if len(sites) == 1 else None
+    return manager.site(ask('ID/domain situs', default))['id']
+
+
+def configure(manager):
+    if manager.config and manager.config.get('setup_complete', True):
+        return
+    if manager.config:
+        cfg = manager.config
+        print('Melanjutkan setup server yang sebelumnya terhenti...')
+        manager.setup(cfg['stack'], cfg['database'])
+        return
+    print('Setup awal VPS bersih (berlaku untuk seluruh situs).')
+    stack = ask('Web server: 1=Nginx, 2=Apache', '1')
+    database = ask('Database: 1=MariaDB, 2=MySQL', '1')
+    if stack not in ('1', '2') or database not in ('1', '2'):
+        raise ValueError('Pilihan harus 1 atau 2.')
+    manager.setup('nginx' if stack == '1' else 'apache',
+                  'mariadb' if database == '1' else 'mysql')
+
+
+def install_interactive(manager, host=None, email=None):
+    host = host or ask('Domain primary')
+    email = email or ask('Email admin / Let\'s Encrypt')
+    title = ask('Judul situs', 'WordPress')
+    admin = ask('Username admin', 'wpadmin')
+    password = password_prompt()
+    configure(manager)
+    site, password = manager.install(host, email, title, admin, password)
+    print(f'\nWordPress siap: https://{site["primary"]}/wp-admin/')
+    print(f'Username: {admin}\nPassword: {password}')
+    print(f'Kredensial root-only: {manager.data}/credentials/{site["id"]}.json')
+
+
+def pma_interactive(manager, host=None, email=None):
+    host = host or ask('Domain khusus phpMyAdmin (contoh db.example.com)')
+    email = email or ask('Email Let\'s Encrypt')
+    user = ask('Username Basic Auth', 'panel')
+    pma, password = manager.install_pma(host, email, user, password_prompt())
+    print(f'phpMyAdmin: https://{pma["domain"]}/\nBasic Auth: {user}\nPassword: {password}')
+    print('Setelah Basic Auth, login menggunakan user database situs (bukan akun root).')
+
+
+def confirm(text, token):
+    if input(f'{text}\nKetik {token} untuk lanjut: ').strip() != token:
+        raise ValueError('Operasi dibatalkan.')
+
+
+def menu(manager):
+    choices = [
+        ('1', 'Install WordPress otomatis'), ('2', 'Daftar situs & domain'),
+        ('3', 'Add domain secondary (301)'), ('4', 'Change domain primary'),
+        ('5', 'Delete domain secondary'), ('6', 'Install phpMyAdmin'),
+        ('7', 'Delete panel phpMyAdmin'), ('8', 'Backup situs + database'),
+        ('9', 'Restore backup'), ('10', 'SSL / perbaiki instalasi SSL'),
+        ('11', 'Update WordPress core'), ('12', 'Status & diagnosis'),
+        ('13', 'Lihat kredensial situs'), ('14', 'Lanjutkan instalasi gagal'),
+        ('0', 'Keluar'),
+    ]
+    while True:
+        print('\n' + '=' * 78)
+        print(f' WPI — WordPress Installer  v{__version__}'.center(78))
+        cfg = manager.config
+        print((' Ubuntu CLI | ' + (f'{cfg["stack"]} / {cfg["database"]} / PHP {cfg["php_version"]}'
+                                  if cfg else 'Setup otomatis pada instalasi pertama')).center(78))
+        print('=' * 78)
+        for i in range(0, len(choices), 2):
+            left = f'({choices[i][0]}) {choices[i][1]}'
+            right = f'({choices[i+1][0]}) {choices[i+1][1]}' if i + 1 < len(choices) else ''
+            print(f'{left:<40}{right}')
+        print('=' * 78)
+        choice = input('Masukkan nomor: ').strip()
+        try:
+            if choice == '0':
+                return
+            elif choice == '1':
+                install_interactive(manager)
+            elif choice == '2':
+                show_sites(manager)
+            elif choice == '3':
+                site = manager.add_secondary(select_site(manager), ask('Domain secondary baru'))
+                print('Secondary terpasang -> https://' + site['primary'] + ' (301).')
+            elif choice == '4':
+                identifier = select_site(manager)
+                host = ask('Domain primary baru')
+                confirm('URL database akan diganti, domain primary lama dilepas. Backup otomatis dibuat.', host)
+                site, backup = manager.change_primary(identifier, host)
+                print(f'Primary: {site["primary"]}\nBackup: {backup}')
+            elif choice == '5':
+                identifier = select_site(manager)
+                host = ask('Domain secondary yang dilepas')
+                confirm('Lepas domain dari vhost dan SSL situs.', host)
+                manager.remove_secondary(identifier, host)
+                print('Domain secondary dilepas.')
+            elif choice == '6':
+                pma_interactive(manager)
+            elif choice == '7':
+                confirm('Hapus akses browser phpMyAdmin. Database situs tetap tersedia.', 'HAPUS PANEL')
+                manager.remove_pma()
+                print('Panel phpMyAdmin dilepas; database tetap tersedia.')
+            elif choice == '8':
+                print('Backup lengkap: ' + str(manager.backup(select_site(manager))))
+            elif choice == '9':
+                identifier = select_site(manager)
+                folder = ask('Path folder backup lengkap')
+                confirm('Restore akan mengganti file dan database situs. Backup kondisi sekarang dibuat.', 'RESTORE')
+                _, safety = manager.restore(identifier, folder)
+                print('Restore selesai. Backup sebelum restore: ' + str(safety))
+            elif choice == '10':
+                manager.retry_install_ssl(select_site(manager))
+                print('SSL aktif. Renewal timer Certbot sudah dikonfigurasi.')
+            elif choice == '11':
+                print('Update selesai. Backup: ' + str(manager.update_wordpress(select_site(manager))))
+            elif choice == '12':
+                print('\n'.join(manager.doctor()))
+            elif choice == '13':
+                identifier = select_site(manager)
+                path = manager.data / 'credentials' / (identifier + '.json')
+                print(path.read_text(encoding='utf-8'))
+            elif choice == '14':
+                site, password = manager.resume_install(select_site(manager))
+                print(f'https://{site["primary"]}/wp-admin/\nUsername: {site["admin"]}\nPassword: {password}')
+            else:
+                print('Pilihan tidak dikenal.')
+        except (ValueError, RuntimeError, OSError) as error:
+            print('Gagal: ' + str(error))
+        input('\nTekan Enter untuk kembali ke panel...')
+
+
+@contextlib.contextmanager
+def operation_lock():
+    # One panel at a time prevents two operations assigning the same hostname.
+    import fcntl
+    DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (DATA / 'operation.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError('Panel WPI lain sedang berjalan. Tutup panel tersebut dahulu.') from None
+        yield
+
+
+def parser():
+    result = argparse.ArgumentParser(description='WPI: panel WordPress otomatis untuk Ubuntu.')
+    result.add_argument('--version', action='version', version=__version__)
+    commands = result.add_subparsers(dest='command')
+    commands.add_parser('menu')
+    commands.add_parser('list')
+    commands.add_parser('status')
+    setup = commands.add_parser('setup')
+    setup.add_argument('--stack', choices=['nginx', 'apache'], default='nginx')
+    setup.add_argument('--database', choices=['mariadb', 'mysql'], default='mariadb')
+    for name in ('install', 'pma-install'):
+        command = commands.add_parser(name)
+        command.add_argument('domain', nargs='?')
+        command.add_argument('--email')
+    for name in ('add-domain', 'change-domain', 'delete-domain'):
+        command = commands.add_parser(name)
+        command.add_argument('site')
+        command.add_argument('domain')
+    for name in ('backup', 'ssl', 'retry-install', 'update'):
+        command = commands.add_parser(name)
+        command.add_argument('site')
+    restore = commands.add_parser('restore')
+    restore.add_argument('site')
+    restore.add_argument('backup')
+    commands.add_parser('pma-delete')
+    return result
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    if sys.platform != 'linux' or os.geteuid() != 0:
+        print('Jalankan sebagai root di Ubuntu: sudo wpi', file=sys.stderr)
+        return 1
+    manager = Manager()
+    try:
+        with operation_lock():
+            command = args.command or 'menu'
+            if command == 'menu':
+                menu(manager)
+            elif command == 'setup':
+                manager.setup(args.stack, args.database)
+            elif command == 'list':
+                show_sites(manager)
+            elif command == 'status':
+                print('\n'.join(manager.doctor()))
+            elif command == 'install':
+                install_interactive(manager, args.domain, args.email)
+            elif command == 'pma-install':
+                pma_interactive(manager, args.domain, args.email)
+            elif command == 'pma-delete':
+                confirm('Hapus akses browser phpMyAdmin; database tetap tersedia.', 'HAPUS PANEL')
+                manager.remove_pma()
+            elif command == 'add-domain':
+                manager.add_secondary(args.site, args.domain)
+            elif command == 'change-domain':
+                confirm('Ganti primary dan lepas domain lama; backup otomatis.', args.domain)
+                site, backup = manager.change_primary(args.site, args.domain)
+                print(f'Primary: {site["primary"]}\nBackup: {backup}')
+            elif command == 'delete-domain':
+                confirm('Lepas domain secondary.', args.domain)
+                manager.remove_secondary(args.site, args.domain)
+            elif command == 'backup':
+                print(manager.backup(args.site))
+            elif command == 'restore':
+                confirm('Restore file dan database situs.', 'RESTORE')
+                _, safety = manager.restore(args.site, args.backup)
+                print('Restore selesai. Backup sebelum restore: ' + str(safety))
+            elif command == 'ssl':
+                manager.retry_install_ssl(args.site)
+            elif command == 'retry-install':
+                site, password = manager.resume_install(args.site)
+                print(f'https://{site["primary"]}/wp-admin/\nUsername: {site["admin"]}\nPassword: {password}')
+            elif command == 'update':
+                print('Update selesai. Backup: ' + str(manager.update_wordpress(args.site)))
+    except (ValueError, RuntimeError, OSError) as error:
+        print('Gagal: ' + str(error), file=sys.stderr)
+        return 1
+    except (KeyboardInterrupt, EOFError):
+        print('\nPanel ditutup. Data yang sudah dibuat tetap tersedia.')
+        return 130
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

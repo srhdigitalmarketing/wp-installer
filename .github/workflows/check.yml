@@ -1,0 +1,88 @@
+name: Checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python / ${{ matrix.os }} / ${{ matrix.python }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.10', '3.12']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Compile package
+        run: python -m compileall -q wpi
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: CLI help
+        run: python -m wpi.cli --help
+
+  bootstrap:
+    name: Bootstrap shell checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax
+        run: bash -n install.sh
+      - name: ShellCheck
+        run: shellcheck --severity=warning install.sh
+      - name: Build local test bundle
+        run: |
+          python3 - <<'PY'
+          import hashlib, pathlib, zipfile
+          package = pathlib.Path('bootstrap-test.zip')
+          with zipfile.ZipFile(package, 'w', zipfile.ZIP_DEFLATED) as bundle:
+              for source in pathlib.Path('wpi').rglob('*.py'):
+                  bundle.write(source, source.as_posix())
+          package.with_suffix('.zip.sha256').write_text(
+              hashlib.sha256(package.read_bytes()).hexdigest() + '  ' + package.name + '\n',
+              encoding='utf-8')
+          unsafe = pathlib.Path('bootstrap-unsafe.zip')
+          with zipfile.ZipFile(unsafe, 'w', zipfile.ZIP_DEFLATED) as bundle:
+              for source in pathlib.Path('wpi').rglob('*.py'):
+                  bundle.write(source, source.as_posix())
+              bundle.writestr('../outside.py', 'pass\n')
+          unsafe.with_suffix('.zip.sha256').write_text(
+              hashlib.sha256(unsafe.read_bytes()).hexdigest() + '  ' + unsafe.name + '\n',
+              encoding='utf-8')
+          PY
+      - name: Validate local bundle without system changes
+        run: bash install.sh --bundle ./bootstrap-test.zip --check-only
+      - name: Reject incorrect SHA256
+        run: |
+          if bash install.sh --bundle ./bootstrap-test.zip --sha256 "$(printf '0%.0s' {1..64})" --check-only; then
+            echo 'An incorrect SHA256 was accepted.' >&2
+            exit 1
+          fi
+      - name: Reject ZIP path traversal
+        run: |
+          if bash install.sh --bundle ./bootstrap-unsafe.zip --check-only; then
+            echo 'An unsafe ZIP path was accepted.' >&2
+            exit 1
+          fi
+
+  integration:
+    name: Ubuntu integration / ${{ matrix.os }} / ${{ matrix.stack }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+        stack: [nginx, apache]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Disposable runner integration
+        run: sudo env CI=true WPI_DISPOSABLE_VM=1 bash tests/integration.sh "${{ matrix.stack }}"
