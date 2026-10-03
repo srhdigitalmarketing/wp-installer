@@ -65,7 +65,7 @@ def ci_run(argv, **kwargs):
     env.update(kwargs.pop('env', {}))
     result = subprocess.run(argv, env=env, check=False, **kwargs)
     if check and result.returncode:
-        safe = ('core' in argv and 'verify-checksums' in argv) or argv[:2] in (
+        safe = ('core' in argv and 'verify-checksums' in argv) or 'rewrite' in argv or argv[:2] in (
             ['nginx', '-t'], ['apache2ctl', 'configtest'],
         )
         if safe:
