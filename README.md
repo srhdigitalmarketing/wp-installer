@@ -22,6 +22,10 @@ WPI mengatur server web, PHP-FPM, database, WordPress, virtual host, dan HTTPS.
   **database dan situs WordPress tetap ada**.
 - Backup/restore situs, pemeriksaan layanan, dan pengelolaan SSL melalui menu.
 
+WordPress diunduh dari ZIP resmi dan diverifikasi checksum sebelum pemasangan.
+ZIP menghindari masalah nama file panjang pada ekstraksi tar WordPress 7.
+[Laporan upstream WP-CLI](https://github.com/wp-cli/core-command/issues/336)
+
 ## Persiapan server
 
 Gunakan **Ubuntu Server 24.04 LTS** untuk instalasi baru; Ubuntu 22.04 LTS

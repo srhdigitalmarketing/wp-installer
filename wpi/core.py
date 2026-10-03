@@ -255,7 +255,8 @@ class Manager:
                    f"CREATE USER '{site['db_user']}'@'localhost' IDENTIFIED BY '{dbpass}';\n"
                    f"GRANT ALL PRIVILEGES ON `{site['db_name']}`.* TO '{site['db_user']}'@'localhost';\n")
             self.runner(['mysql', '--protocol=socket', '-uroot'], input=sql)
-            self.wp(site, 'core', 'download')
+            # ZIP avoids PHP PharData truncating long filenames in WP 7 tarballs.
+            self.wp(site, 'core', 'download', 'https://wordpress.org/latest.zip')
             self.wp(site, 'core', 'verify-checksums')
             self.wp(site, 'config', 'create', f'--dbname={site["db_name"]}',
                     f'--dbuser={site["db_user"]}', '--dbhost=localhost',
@@ -305,7 +306,15 @@ class Manager:
         self.runner(['chown', '-R', 'www-data:www-data', str(Path(site['root']).parent)])
         intact = self.wp(site, 'core', 'verify-checksums', check=False)
         if intact.returncode:
-            self.wp(site, 'core', 'download', '--force')
+            # Preserve partial/corrupt core directories for recovery, then fetch
+            # complete directories. wp-content and wp-config.php are retained.
+            preserved = Path(site['root']).parent / ('incomplete-core-' + secrets.token_hex(4))
+            preserved.mkdir(mode=0o700)
+            for name in ('wp-admin', 'wp-includes'):
+                source = Path(site['root']) / name
+                if source.exists():
+                    source.rename(preserved / name)
+            self.wp(site, 'core', 'download', 'https://wordpress.org/latest.zip', '--force')
         self.wp(site, 'core', 'verify-checksums')
         if not (Path(site['root']) / 'wp-config.php').exists():
             self.wp(site, 'config', 'create', f'--dbname={site["db_name"]}', f'--dbuser={site["db_user"]}',
