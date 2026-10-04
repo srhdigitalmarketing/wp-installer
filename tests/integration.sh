@@ -42,6 +42,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import re
+import select
 import shutil
 import subprocess
 import sys
@@ -264,6 +265,40 @@ def verify_real_fpm_congestion(site):
         slow.unlink(missing_ok=True)
         subprocess.run(['systemctl', 'start', 'wpi-autotune.timer'], check=True)
 
+
+def reinstall_with_idle_panel():
+    """Exercise the installed launcher while another real menu waits for input."""
+    panel = subprocess.Popen(['/usr/local/bin/wpi'], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             env={**os.environ, 'PYTHONUNBUFFERED': '1'})
+    try:
+        output = b''
+        deadline = time.monotonic() + 10
+        while b'Masukkan nomor:' not in output:
+            remaining = deadline - time.monotonic()
+            assert remaining > 0 and panel.poll() is None, 'Idle panel did not reach its menu.'
+            ready, _, _ = select.select([panel.stdout], [], [], remaining)
+            assert ready, 'Timed out waiting for the idle panel menu.'
+            chunk = os.read(panel.stdout.fileno(), 65536)
+            assert chunk, 'Panel exited before displaying its menu.'
+            output += chunk
+        for command in ('status', 'list'):
+            subprocess.run(['/usr/local/bin/wpi', command], check=True,
+                           text=True, capture_output=True, timeout=20)
+        subprocess.run(['bash', 'install.sh', '--bundle', os.environ['WPI_CI_BUNDLE'],
+                        '--sha256', os.environ['WPI_CI_BUNDLE_SHA']], check=True, timeout=120)
+        assert panel.poll() is None, 'Application upgrade closed the existing idle panel.'
+    finally:
+        try:
+            panel.communicate(input=b'0\n', timeout=10)
+        except subprocess.TimeoutExpired:
+            panel.terminate()
+            panel.communicate(timeout=10)
+    assert panel.returncode == 0, 'Idle panel did not close normally.'
+    print('Real installed idle panel allowed status, list, and bootstrap upgrade; '
+          'panel closed normally with option 0.', flush=True)
+
+
 with mock.patch.object(core, 'check_dns', return_value=None), \
      mock.patch.object(WebStack, 'obtain_certificate', local_certificate):
     site, _ = manager.install(old, 'owner@example.com', admin='ciadmin', password='CiWordPressPassword123!')
@@ -347,10 +382,10 @@ with mock.patch.object(core, 'check_dns', return_value=None), \
     def persistent_state():
         return {str(path.relative_to(manager.data)): path.read_bytes()
                 for path in manager.data.rglob('*') if path.is_file()
-                and path.relative_to(manager.data).parts[0] != 'autotune'}
+                and path.relative_to(manager.data).parts[0] != 'autotune'
+                and path.relative_to(manager.data).as_posix() != 'operation.lock'}
     state_before = persistent_state()
-    subprocess.run(['bash', 'install.sh', '--bundle', os.environ['WPI_CI_BUNDLE'],
-                    '--sha256', os.environ['WPI_CI_BUNDLE_SHA']], check=True)
+    reinstall_with_idle_panel()
     state_after = persistent_state()
     assert state_after == state_before, 'Application reinstall changed managed site state or credentials.'
     version = subprocess.run(['/usr/local/bin/wpi', '--version'], check=True, text=True, capture_output=True)

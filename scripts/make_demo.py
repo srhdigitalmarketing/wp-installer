@@ -89,7 +89,9 @@ def capture(function, answers=()):
         output.write(prompt + '[Enter: otomatis]\n')
         return ''
 
-    with contextlib.redirect_stdout(output), patch('builtins.input', enter), patch('getpass.getpass', password):
+    with contextlib.redirect_stdout(output), patch('builtins.input', enter), \
+         patch('getpass.getpass', password), \
+         patch.object(cli, 'operation_lock', contextlib.nullcontext):
         function()
     return output.getvalue().strip('\n')
 

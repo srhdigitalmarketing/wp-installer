@@ -70,12 +70,12 @@ sudo apt-get update
 sudo apt-get install -y curl ca-certificates
 
 curl -fL --proto '=https' --proto-redir '=https' \
-  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.2.0/install.sh \
+  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.2.1/install.sh \
   -o install.sh
 curl -fL --proto '=https' --proto-redir '=https' \
-  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.2.0/install.sh.sha256 \
+  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.2.1/install.sh.sha256 \
   -o install.sh.sha256
-sha256sum --check install.sh.sha256 && sudo bash install.sh --version v1.2.0
+sha256sum --check install.sh.sha256 && sudo bash install.sh --version v1.2.1
 
 sudo wpi
 ```
@@ -88,25 +88,25 @@ percaya atau tinjau kode pada tag versi tersebut.
 
 ### Memakai bundle lokal
 
-Unduh `wp-installer-v1.2.0.zip` dan `wp-installer-v1.2.0.zip.sha256`
-dari [release v1.2.0](https://github.com/srhdigitalmarketing/wp-installer/releases/tag/v1.2.0),
+Unduh `wp-installer-v1.2.1.zip` dan `wp-installer-v1.2.1.zip.sha256`
+dari [release v1.2.1](https://github.com/srhdigitalmarketing/wp-installer/releases/tag/v1.2.1),
 lalu salin ke server bersama `install.sh`.
 
 ```bash
-sudo bash install.sh --bundle ./wp-installer-v1.2.0.zip
+sudo bash install.sh --bundle ./wp-installer-v1.2.1.zip
 sudo wpi
 ```
 
 Hash yang diperoleh secara terpisah juga dapat diberikan melalui `--sha256`:
 
 ```bash
-sudo bash install.sh --bundle ./wp-installer-v1.2.0.zip --sha256 HASH_SHA256_RILIS
+sudo bash install.sh --bundle ./wp-installer-v1.2.1.zip --sha256 HASH_SHA256_RILIS
 ```
 
 Validasi bundle tanpa pemasangan, tanpa akses root, dan tanpa jaringan:
 
 ```bash
-bash install.sh --bundle ./wp-installer-v1.2.0.zip --check-only
+bash install.sh --bundle ./wp-installer-v1.2.1.zip --check-only
 ```
 
 Mode ini memerlukan Bash dan Python 3.10+. SHA256, keamanan path ZIP, kelengkapan
@@ -213,10 +213,35 @@ terpisah yang aksesnya dibatasi. Log panel tidak mencatat password.
 
 Menjalankan bootstrap lagi mengganti aplikasi secara atomik dan mempertahankan
 data situs serta backup. Paket server dan konten WordPress dikelola terpisah
-dari pembaruan aplikasi WPI. Untuk memperbarui instalasi v1.0.0 atau v1.1.0,
-jalankan ulang perintah instalasi v1.2.0 di atas. Pada stack WPI yang sudah
+dari pembaruan aplikasi WPI. Untuk memperbarui instalasi versi sebelumnya,
+tutup menu lama yang sedang menunggu pilihan dengan **0**, lalu jalankan ulang
+perintah instalasi v1.2.1 di atas. Tunggu operasi yang sedang berjalan selesai
+sebelum menutup panel. Pada stack WPI yang sudah
 selesai disiapkan, bootstrap otomatis mengaktifkan pengelolaan PHP/FPM tanpa
 menginstal ulang WordPress atau meminta pengaturan tambahan.
+
+### Panel atau operasi WPI sedang berjalan
+
+Versi hingga v1.2.0 mengunci seluruh sesi panel, termasuk saat menunggu pilihan.
+Pesan `Panel WPI lain sedang berjalan. Tutup panel tersebut dahulu.` dapat
+muncul ketika panel lama masih terbuka di terminal atau sesi SSH lain. Tutup
+panel tersebut dengan **0** saat sudah kembali ke menu, lalu pasang v1.2.1.
+
+Mulai v1.2.1, menu, prompt, `sudo wpi list`, dan `sudo wpi status` tidak menahan
+kunci operasi. Beberapa panel dapat dibuka bersamaan; operasi yang mengubah
+situs atau konfigurasi tetap dijalankan satu per satu. Jika operasi lain sedang
+berjalan, tunggu hingga selesai dan ulangi pilihan Anda.
+
+Untuk melihat proses yang memegang kunci, jalankan pemeriksaan berikut:
+
+```bash
+sudo lslocks -o PID,COMMAND,PATH | grep '/var/lib/wpi/operation.lock'
+```
+
+File `/var/lib/wpi/operation.lock` tetap ada setelah panel ditutup; keberadaan
+file tersebut adalah normal. **Jangan hapus file kunci.** Kunci dilepas otomatis
+ketika operasi atau proses pemegangnya berakhir; menghapus file saat masih
+dipakai dapat membuat dua operasi mengubah situs bersamaan.
 
 ## PHP dan FPM otomatis
 

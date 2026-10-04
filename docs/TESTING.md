@@ -12,6 +12,19 @@ paket, mengubah database server, meminta sertifikat, atau menghapus berkas siste
 Tujuannya memeriksa batas input, domain yang sudah dipakai, redirect secondary,
 rollback pergantian primary, serta pemisahan penghapusan phpMyAdmin dari database.
 
+Tes panel memastikan menu dan prompt tidak memegang kunci operasi, sementara
+setiap perubahan memakai satu kunci selama seluruh rangkaian operasi. Pemilihan
+situs sebelum operasi harus memakai ID yang stabil, dan metadata situs/domain
+dibaca ulang serta divalidasi ketika operasi mulai dijalankan.
+
+Pada Linux, tes subprocess menggunakan `flock` dari kernel dan direktori
+sementara untuk membuktikan panel yang menunggu pilihan tidak menghalangi
+perintah lain. Operasi kedua harus ditolak selama perubahan pertama berjalan;
+perintah baca `list` dan `status` tetap tersedia. Periksa pelepasan kunci setelah
+operasi selesai, gagal, atau proses berakhir. File kunci yang masih ada tanpa
+pemegang aktif tidak boleh menghalangi operasi berikutnya. Tes Linux tersebut
+dilewati pada Windows; tes dispatch/prompt tetap dijalankan di kedua sistem.
+
 Untuk controller PHP/FPM, tes dengan data resource dan status FPM buatan dapat
 memeriksa keputusan tanpa membebani VPS. Cakupan yang diperlukan: pembatasan
 RAM/CPU container, perhitungan kapasitas awal, kenaikan ketika antrean bertambah,
@@ -50,6 +63,14 @@ Untuk PHP/FPM otomatis, periksa konfigurasi pool dan INI hasil pemasangan,
 layanan pemantauan lokal, timer aktif, serta informasi pada `sudo wpi status`.
 Pemasangan ulang pada stack yang sudah dikelola harus mengaktifkan controller
 tanpa mengganti database, situs, atau kredensial.
+
+Untuk regresi v1.2.1, buka panel terpasang dan biarkan menunggu pilihan saat
+menjalankan pemeriksaan status serta pemasangan ulang aplikasi. Kedua alur harus
+berhasil karena panel yang diam tidak memegang kunci operasi. Pengujian harus
+tetap membuktikan perubahan dari proses lain tidak bisa berjalan bersamaan
+dengan operasi yang sedang menulis. Panel versi lama hingga v1.2.0 tetap perlu
+ditutup dari menunya sebelum upgrade, karena proses lama memakai perilaku kunci
+yang lama sampai berakhir.
 
 Pengujian antrean memakai request HTTP yang benar-benar mengisi pool PHP,
 status FastCGI lokal, dan backlog socket Unix dari kernel. Keputusan kenaikan

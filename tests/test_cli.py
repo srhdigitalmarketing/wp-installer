@@ -3,10 +3,11 @@
 import contextlib
 import io
 from pathlib import Path
+import tempfile
 import unittest
 from unittest import mock
 
-from wpi import cli
+from wpi import cli, core
 
 
 class CliTests(unittest.TestCase):
@@ -125,6 +126,7 @@ class CliTests(unittest.TestCase):
     def test_setup_stack_and_database_are_selected_explicitly(self):
         manager = mock.Mock(config={})
         with mock.patch("builtins.input", side_effect=["2", "2"]), \
+             mock.patch.object(cli, 'operation_lock', return_value=contextlib.nullcontext()), \
              contextlib.redirect_stdout(io.StringIO()):
             cli.configure(manager)
         manager.setup.assert_called_once_with("apache", "mysql")
@@ -153,6 +155,229 @@ class CliTests(unittest.TestCase):
                       "Install phpMyAdmin", "Delete panel phpMyAdmin", "Backup", "Restore", "Keluar"]:
             self.assertIn(label, text)
         manager.setup.assert_not_called()
+
+    def test_opening_idle_menu_does_not_acquire_operation_lock(self):
+        manager = mock.Mock(config={})
+        with mock.patch.object(cli.sys, 'platform', 'linux'), \
+             mock.patch.object(cli.os, 'geteuid', return_value=0, create=True), \
+             mock.patch.object(cli, 'Manager', return_value=manager), \
+             mock.patch.object(cli, 'operation_lock', side_effect=ValueError('occupied')) as lock, \
+             mock.patch('builtins.input', return_value='0'), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.main([]), 0)
+        lock.assert_not_called()
+
+    def test_read_only_commands_work_during_another_operation(self):
+        for command in ('list', 'status'):
+            with self.subTest(command=command):
+                manager = mock.Mock()
+                manager.sites.return_value = []
+                manager.doctor.return_value = ['Services available']
+                with mock.patch.object(cli.sys, 'platform', 'linux'), \
+                     mock.patch.object(cli.os, 'geteuid', return_value=0, create=True), \
+                     mock.patch.object(cli, 'Manager', return_value=manager), \
+                     mock.patch.object(cli, 'operation_lock', side_effect=ValueError('occupied')) as lock, \
+                     contextlib.redirect_stdout(io.StringIO()), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(cli.main([command]), 0)
+                lock.assert_not_called()
+
+    def test_scripted_mutation_locks_only_after_confirmation(self):
+        manager = mock.Mock()
+        manager.change_primary.return_value = ({'primary': 'new.example.com'}, Path('/backup'))
+        locked = False
+        acquisitions = []
+
+        @contextlib.contextmanager
+        def operation():
+            nonlocal locked
+            self.assertFalse(locked)
+            acquisitions.append(True)
+            locked = True
+            try:
+                yield
+            finally:
+                locked = False
+
+        def answer(prompt):
+            self.assertFalse(locked, 'An unanswered prompt must not block another panel.')
+            return 'new.example.com'
+
+        def change(*args):
+            self.assertTrue(locked, 'A domain change must be serialized with other mutations.')
+            return {'primary': 'new.example.com'}, Path('/backup')
+
+        manager.change_primary.side_effect = change
+        with mock.patch.object(cli.sys, 'platform', 'linux'), \
+             mock.patch.object(cli.os, 'geteuid', return_value=0, create=True), \
+             mock.patch.object(cli, 'Manager', return_value=manager), \
+             mock.patch.object(cli, 'operation_lock', side_effect=operation), \
+             mock.patch('builtins.input', side_effect=answer), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.main(['change-domain', 'old.example.com', 'new.example.com']), 0)
+        self.assertEqual(len(acquisitions), 1)
+        self.assertFalse(locked)
+
+    def test_initial_setup_and_wordpress_install_share_one_operation_lock(self):
+        manager = mock.Mock(config={}, data=Path('/var/lib/wpi'))
+        site = {'id': 'abcdef123456', 'primary': 'new.example.com'}
+        locked = False
+        operations = []
+
+        @contextlib.contextmanager
+        def operation():
+            nonlocal locked
+            self.assertFalse(locked)
+            operations.append('acquire')
+            locked = True
+            try:
+                yield
+            finally:
+                locked = False
+                operations.append('release')
+
+        def setup(stack, database):
+            self.assertTrue(locked)
+            self.assertEqual((stack, database), ('nginx', 'mariadb'))
+            operations.append('setup')
+
+        def install(host, email, title, admin, password):
+            self.assertTrue(locked)
+            self.assertEqual((host, email, title, admin, password),
+                             ('new.example.com', 'owner@example.com', 'WordPress', 'wpadmin', None))
+            operations.append('install')
+            return site, 'GeneratedPassword'
+
+        replies = iter(['new.example.com', 'owner@example.com', '', '', '1', '1'])
+
+        def answer(prompt):
+            self.assertFalse(locked, 'Initial configuration questions must not hold the operation lock.')
+            return next(replies)
+
+        def hidden(prompt):
+            self.assertFalse(locked, 'Password input must finish before lock acquisition.')
+            return ''
+
+        manager.setup.side_effect = setup
+        manager.install.side_effect = install
+        with mock.patch.object(cli, 'operation_lock', side_effect=operation), \
+             mock.patch('builtins.input', side_effect=answer), \
+             mock.patch.object(cli.getpass, 'getpass', side_effect=hidden), \
+             contextlib.redirect_stdout(io.StringIO()):
+            cli.install_interactive(manager)
+        self.assertEqual(operations, ['acquire', 'setup', 'install', 'release'])
+        self.assertFalse(locked)
+
+    def test_menu_mutation_releases_lock_before_returning_to_menu(self):
+        manager = mock.Mock(config={})
+        site = {'id': 'abcdef123456', 'primary': 'old.example.com',
+                'secondary': [], 'status': 'active'}
+        manager.sites.return_value = [site]
+        manager.site.return_value = site
+        locked = False
+        acquired = []
+
+        @contextlib.contextmanager
+        def operation():
+            nonlocal locked
+            self.assertFalse(locked)
+            acquired.append(True)
+            locked = True
+            try:
+                yield
+            finally:
+                locked = False
+
+        def add(identifier, domain):
+            self.assertTrue(locked)
+            self.assertEqual((identifier, domain), ('abcdef123456', 'alias.example.com'))
+            return site
+
+        replies = iter(['3', '', 'alias.example.com', '', '2', '', '0'])
+
+        def answer(prompt):
+            self.assertFalse(locked, 'Menu input and confirmation must not own the mutation lock.')
+            return next(replies)
+
+        manager.add_secondary.side_effect = add
+        with mock.patch.object(cli, 'operation_lock', side_effect=operation), \
+             mock.patch('builtins.input', side_effect=answer), \
+             contextlib.redirect_stdout(io.StringIO()):
+            cli.menu(manager)
+        self.assertEqual(len(acquired), 1)
+        self.assertFalse(locked)
+        manager.add_secondary.assert_called_once()
+
+    def test_menu_busy_operation_can_be_retried_without_reopening_panel(self):
+        manager = mock.Mock(config={})
+        site = {'id': 'abcdef123456', 'primary': 'old.example.com',
+                'secondary': [], 'status': 'active'}
+        manager.sites.return_value = [site]
+        manager.site.return_value = site
+        manager.add_secondary.return_value = site
+        acquisitions = 0
+
+        @contextlib.contextmanager
+        def operation():
+            nonlocal acquisitions
+            acquisitions += 1
+            if acquisitions == 1:
+                raise ValueError('Operasi WPI lain sedang berjalan; coba lagi setelah selesai.')
+            yield
+
+        with mock.patch.object(cli, 'operation_lock', side_effect=operation), \
+             mock.patch('builtins.input', side_effect=[
+                 '3', '', 'alias.example.com', '', '2', '',
+                 '3', '', 'alias.example.com', '', '0',
+             ]), contextlib.redirect_stdout(io.StringIO()) as output:
+            cli.menu(manager)
+        self.assertIn('Operasi WPI lain sedang berjalan', output.getvalue())
+        self.assertEqual(acquisitions, 2)
+        manager.add_secondary.assert_called_once_with('abcdef123456', 'alias.example.com')
+        self.assertGreaterEqual(manager.sites.call_count, 3)
+
+    def test_busy_scripted_mutation_returns_error_without_mutating(self):
+        manager = mock.Mock()
+        with mock.patch.object(cli.sys, 'platform', 'linux'), \
+             mock.patch.object(cli.os, 'geteuid', return_value=0, create=True), \
+             mock.patch.object(cli, 'Manager', return_value=manager), \
+             mock.patch.object(cli, 'operation_lock', side_effect=ValueError('operation occupied')), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(cli.main(['add-domain', 'old.example.com', 'alias.example.com']), 1)
+        manager.add_secondary.assert_not_called()
+        self.assertIn('operation occupied', errors.getvalue())
+
+    def test_domain_uniqueness_is_rechecked_from_disk_after_lock_acquisition(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = mock.Mock()
+            manager = core.Manager(Path(folder) / 'state', Path(folder) / 'backups', runner=runner)
+            primary = {'id': 'abcdef123456', 'primary': 'old.example.com',
+                       'secondary': [], 'status': 'active'}
+            other = {'id': '123456abcdef', 'primary': 'other.example.com',
+                     'secondary': [], 'status': 'active'}
+            manager.save_site(primary)
+            other_manager = core.Manager(manager.data, manager.backups, runner=runner)
+
+            @contextlib.contextmanager
+            def operation():
+                # A different panel claimed the chosen domain while the user was
+                # answering prompts. The operation must reread this new state.
+                other['secondary'] = ['alias.example.com']
+                other_manager.save_site(other)
+                yield
+
+            with mock.patch.object(cli, 'operation_lock', side_effect=operation), \
+                 mock.patch.object(core, 'check_dns', side_effect=AssertionError('Conflict must be rejected before DNS.')), \
+                 mock.patch('builtins.input', side_effect=['3', '', 'alias.example.com', '', '0']), \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                cli.menu(manager)
+            self.assertIn('sudah dipakai situs lain', output.getvalue())
+            self.assertEqual(manager.site(primary['id'])['secondary'], [])
+            self.assertEqual(manager.site(other['id'])['secondary'], ['alias.example.com'])
+            runner.assert_not_called()
 
 
 if __name__ == "__main__":

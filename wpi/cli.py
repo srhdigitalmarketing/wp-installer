@@ -49,21 +49,27 @@ def select_site(manager):
     return manager.site(ask('ID/domain situs', default))['id']
 
 
-def configure(manager):
+def _configuration_selection(manager):
+    """Collect setup choices before acquiring the write-operation lock."""
     if manager.config and manager.config.get('setup_complete', True):
         return
     if manager.config:
         cfg = manager.config
         print('Melanjutkan setup server yang sebelumnya terhenti...')
-        manager.setup(cfg['stack'], cfg['database'])
-        return
+        return cfg['stack'], cfg['database']
     print('Setup awal VPS bersih (berlaku untuk seluruh situs).')
     stack = ask('Web server: 1=Nginx, 2=Apache', '1')
     database = ask('Database: 1=MariaDB, 2=MySQL', '1')
     if stack not in ('1', '2') or database not in ('1', '2'):
         raise ValueError('Pilihan harus 1 atau 2.')
-    manager.setup('nginx' if stack == '1' else 'apache',
-                  'mariadb' if database == '1' else 'mysql')
+    return ('nginx' if stack == '1' else 'apache',
+            'mariadb' if database == '1' else 'mysql')
+
+
+def configure(manager):
+    selection = _configuration_selection(manager)
+    if selection:
+        run_operation(manager.setup, *selection)
 
 
 def install_interactive(manager, host=None, email=None):
@@ -72,8 +78,16 @@ def install_interactive(manager, host=None, email=None):
     title = ask('Judul situs', 'WordPress')
     admin = ask('Username admin', 'wpadmin')
     password = password_prompt()
-    configure(manager)
-    site, password = manager.install(host, email, title, admin, password)
+    selection = _configuration_selection(manager)
+
+    def install():
+        # Keep setup and installation serialized as one composite action.
+        # Manager reads current configuration/sites from disk under this lock.
+        if selection:
+            manager.setup(*selection)
+        return manager.install(host, email, title, admin, password)
+
+    site, password = run_operation(install)
     print(f'\nWordPress siap: https://{site["primary"]}/wp-admin/')
     print(f'Username: {admin}\nPassword: {password}')
     print(f'Kredensial root-only: {manager.data}/credentials/{site["id"]}.json')
@@ -83,7 +97,7 @@ def pma_interactive(manager, host=None, email=None):
     host = host or ask('Domain khusus phpMyAdmin (contoh db.example.com)')
     email = email or ask('Email Let\'s Encrypt')
     user = ask('Username Basic Auth', 'panel')
-    pma, password = manager.install_pma(host, email, user, password_prompt())
+    pma, password = run_operation(manager.install_pma, host, email, user, password_prompt())
     print(f'phpMyAdmin: https://{pma["domain"]}/\nBasic Auth: {user}\nPassword: {password}')
     print('Setelah Basic Auth, login menggunakan user database situs (bukan akun root).')
 
@@ -125,39 +139,39 @@ def menu(manager):
             elif choice == '2':
                 show_sites(manager)
             elif choice == '3':
-                site = manager.add_secondary(select_site(manager), ask('Domain secondary baru'))
+                site = run_operation(manager.add_secondary, select_site(manager), ask('Domain secondary baru'))
                 print('Secondary terpasang -> https://' + site['primary'] + ' (301).')
             elif choice == '4':
                 identifier = select_site(manager)
                 host = ask('Domain primary baru')
                 confirm('URL database akan diganti, domain primary lama dilepas. Backup otomatis dibuat.', host)
-                site, backup = manager.change_primary(identifier, host)
+                site, backup = run_operation(manager.change_primary, identifier, host)
                 print(f'Primary: {site["primary"]}\nBackup: {backup}')
             elif choice == '5':
                 identifier = select_site(manager)
                 host = ask('Domain secondary yang dilepas')
                 confirm('Lepas domain dari vhost dan SSL situs.', host)
-                manager.remove_secondary(identifier, host)
+                run_operation(manager.remove_secondary, identifier, host)
                 print('Domain secondary dilepas.')
             elif choice == '6':
                 pma_interactive(manager)
             elif choice == '7':
                 confirm('Hapus akses browser phpMyAdmin. Database situs tetap tersedia.', 'HAPUS PANEL')
-                manager.remove_pma()
+                run_operation(manager.remove_pma)
                 print('Panel phpMyAdmin dilepas; database tetap tersedia.')
             elif choice == '8':
-                print('Backup lengkap: ' + str(manager.backup(select_site(manager))))
+                print('Backup lengkap: ' + str(run_operation(manager.backup, select_site(manager))))
             elif choice == '9':
                 identifier = select_site(manager)
                 folder = ask('Path folder backup lengkap')
                 confirm('Restore akan mengganti file dan database situs. Backup kondisi sekarang dibuat.', 'RESTORE')
-                _, safety = manager.restore(identifier, folder)
+                _, safety = run_operation(manager.restore, identifier, folder)
                 print('Restore selesai. Backup sebelum restore: ' + str(safety))
             elif choice == '10':
-                manager.retry_install_ssl(select_site(manager))
+                run_operation(manager.retry_install_ssl, select_site(manager))
                 print('SSL aktif. Renewal timer Certbot sudah dikonfigurasi.')
             elif choice == '11':
-                print('Update selesai. Backup: ' + str(manager.update_wordpress(select_site(manager))))
+                print('Update selesai. Backup: ' + str(run_operation(manager.update_wordpress, select_site(manager))))
             elif choice == '12':
                 print('\n'.join(manager.doctor()))
             elif choice == '13':
@@ -165,7 +179,7 @@ def menu(manager):
                 path = manager.data / 'credentials' / (identifier + '.json')
                 print(path.read_text(encoding='utf-8'))
             elif choice == '14':
-                site, password = manager.resume_install(select_site(manager))
+                site, password = run_operation(manager.resume_install, select_site(manager))
                 print(f'https://{site["primary"]}/wp-admin/\nUsername: {site["admin"]}\nPassword: {password}')
             else:
                 print('Pilihan tidak dikenal.')
@@ -176,15 +190,24 @@ def menu(manager):
 
 @contextlib.contextmanager
 def operation_lock():
-    # One panel at a time prevents two operations assigning the same hostname.
+    # Serialize changes, while idle menus and read-only commands remain usable.
     import fcntl
     DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (DATA / 'operation.lock').open('a') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise ValueError('Panel WPI lain sedang berjalan. Tutup panel tersebut dahulu.') from None
-        yield
+            raise ValueError('Operasi WPI lain sedang berjalan. Tunggu hingga selesai, lalu coba lagi.') from None
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def run_operation(action, *args, **kwargs):
+    """Lock only the actual mutation, after prompts and confirmations finish."""
+    with operation_lock():
+        return action(*args, **kwargs)
 
 
 def parser():
@@ -225,55 +248,54 @@ def main(argv=None):
         return 1
     manager = Manager()
     try:
-        # A terminal menu can stay open for hours. The background controller
-        # has its own lock and must keep scaling while the user views the panel.
-        if args.command == 'autotune-tick':
+        command = args.command or 'menu'
+        # Menus do not hold a lock while waiting for input. The background
+        # controller has its own lock; read-only commands need neither lock.
+        if command == 'autotune-tick':
             print(json.dumps(manager.autotune_tick(), ensure_ascii=False, sort_keys=True))
             return 0
-        if args.command == 'autotune-status':
+        if command == 'autotune-status':
             print(json.dumps(manager.autotune_status(), ensure_ascii=False, sort_keys=True))
             return 0
-        with operation_lock():
-            command = args.command or 'menu'
-            if command == 'menu':
-                menu(manager)
-            elif command == 'setup':
-                manager.setup(args.stack, args.database)
-            elif command == 'autotune-enable':
-                print(json.dumps(manager.enable_autotune(), ensure_ascii=False, sort_keys=True))
-            elif command == 'list':
-                show_sites(manager)
-            elif command == 'status':
-                print('\n'.join(manager.doctor()))
-            elif command == 'install':
-                install_interactive(manager, args.domain, args.email)
-            elif command == 'pma-install':
-                pma_interactive(manager, args.domain, args.email)
-            elif command == 'pma-delete':
-                confirm('Hapus akses browser phpMyAdmin; database tetap tersedia.', 'HAPUS PANEL')
-                manager.remove_pma()
-            elif command == 'add-domain':
-                manager.add_secondary(args.site, args.domain)
-            elif command == 'change-domain':
-                confirm('Ganti primary dan lepas domain lama; backup otomatis.', args.domain)
-                site, backup = manager.change_primary(args.site, args.domain)
-                print(f'Primary: {site["primary"]}\nBackup: {backup}')
-            elif command == 'delete-domain':
-                confirm('Lepas domain secondary.', args.domain)
-                manager.remove_secondary(args.site, args.domain)
-            elif command == 'backup':
-                print(manager.backup(args.site))
-            elif command == 'restore':
-                confirm('Restore file dan database situs.', 'RESTORE')
-                _, safety = manager.restore(args.site, args.backup)
-                print('Restore selesai. Backup sebelum restore: ' + str(safety))
-            elif command == 'ssl':
-                manager.retry_install_ssl(args.site)
-            elif command == 'retry-install':
-                site, password = manager.resume_install(args.site)
-                print(f'https://{site["primary"]}/wp-admin/\nUsername: {site["admin"]}\nPassword: {password}')
-            elif command == 'update':
-                print('Update selesai. Backup: ' + str(manager.update_wordpress(args.site)))
+        if command == 'menu':
+            menu(manager)
+        elif command == 'setup':
+            run_operation(manager.setup, args.stack, args.database)
+        elif command == 'autotune-enable':
+            print(json.dumps(run_operation(manager.enable_autotune), ensure_ascii=False, sort_keys=True))
+        elif command == 'list':
+            show_sites(manager)
+        elif command == 'status':
+            print('\n'.join(manager.doctor()))
+        elif command == 'install':
+            install_interactive(manager, args.domain, args.email)
+        elif command == 'pma-install':
+            pma_interactive(manager, args.domain, args.email)
+        elif command == 'pma-delete':
+            confirm('Hapus akses browser phpMyAdmin; database tetap tersedia.', 'HAPUS PANEL')
+            run_operation(manager.remove_pma)
+        elif command == 'add-domain':
+            run_operation(manager.add_secondary, args.site, args.domain)
+        elif command == 'change-domain':
+            confirm('Ganti primary dan lepas domain lama; backup otomatis.', args.domain)
+            site, backup = run_operation(manager.change_primary, args.site, args.domain)
+            print(f'Primary: {site["primary"]}\nBackup: {backup}')
+        elif command == 'delete-domain':
+            confirm('Lepas domain secondary.', args.domain)
+            run_operation(manager.remove_secondary, args.site, args.domain)
+        elif command == 'backup':
+            print(run_operation(manager.backup, args.site))
+        elif command == 'restore':
+            confirm('Restore file dan database situs.', 'RESTORE')
+            _, safety = run_operation(manager.restore, args.site, args.backup)
+            print('Restore selesai. Backup sebelum restore: ' + str(safety))
+        elif command == 'ssl':
+            run_operation(manager.retry_install_ssl, args.site)
+        elif command == 'retry-install':
+            site, password = run_operation(manager.resume_install, args.site)
+            print(f'https://{site["primary"]}/wp-admin/\nUsername: {site["admin"]}\nPassword: {password}')
+        elif command == 'update':
+            print('Update selesai. Backup: ' + str(run_operation(manager.update_wordpress, args.site)))
     except (ValueError, RuntimeError, OSError) as error:
         print('Gagal: ' + str(error), file=sys.stderr)
         return 1
