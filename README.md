@@ -15,7 +15,8 @@ asli dengan backend simulasi serta domain contoh; tidak memasang VPS produksi.
 - Konfigurasi PHP dan PHP-FPM otomatis berdasarkan RAM/CPU yang tersedia,
   termasuk batas resource container. Controller berkala memantau antrean PHP,
   penggunaan worker, memori, dan beban CPU, lalu menyesuaikan kapasitas FPM
-  ketika diperlukan. Tidak perlu mengisi nilai PHP/FPM secara manual.
+  ketika diperlukan. Mulai v1.2.0, kapasitas mengikuti resource server tanpa
+  batas tetap 128 worker. Tidak perlu mengisi nilai PHP/FPM secara manual.
 - Beberapa situs, masing-masing memiliki direktori WordPress, database, dan
   akun database tersendiri.
 - Tambah secondary domain dengan redirect permanen **301** ke primary.
@@ -69,12 +70,12 @@ sudo apt-get update
 sudo apt-get install -y curl ca-certificates
 
 curl -fL --proto '=https' --proto-redir '=https' \
-  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.1.0/install.sh \
+  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.2.0/install.sh \
   -o install.sh
 curl -fL --proto '=https' --proto-redir '=https' \
-  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.1.0/install.sh.sha256 \
+  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.2.0/install.sh.sha256 \
   -o install.sh.sha256
-sha256sum --check install.sh.sha256 && sudo bash install.sh --version v1.1.0
+sha256sum --check install.sh.sha256 && sudo bash install.sh --version v1.2.0
 
 sudo wpi
 ```
@@ -87,25 +88,25 @@ percaya atau tinjau kode pada tag versi tersebut.
 
 ### Memakai bundle lokal
 
-Unduh `wp-installer-v1.1.0.zip` dan `wp-installer-v1.1.0.zip.sha256`
-dari [release v1.1.0](https://github.com/srhdigitalmarketing/wp-installer/releases/tag/v1.1.0),
+Unduh `wp-installer-v1.2.0.zip` dan `wp-installer-v1.2.0.zip.sha256`
+dari [release v1.2.0](https://github.com/srhdigitalmarketing/wp-installer/releases/tag/v1.2.0),
 lalu salin ke server bersama `install.sh`.
 
 ```bash
-sudo bash install.sh --bundle ./wp-installer-v1.1.0.zip
+sudo bash install.sh --bundle ./wp-installer-v1.2.0.zip
 sudo wpi
 ```
 
 Hash yang diperoleh secara terpisah juga dapat diberikan melalui `--sha256`:
 
 ```bash
-sudo bash install.sh --bundle ./wp-installer-v1.1.0.zip --sha256 HASH_SHA256_RILIS
+sudo bash install.sh --bundle ./wp-installer-v1.2.0.zip --sha256 HASH_SHA256_RILIS
 ```
 
 Validasi bundle tanpa pemasangan, tanpa akses root, dan tanpa jaringan:
 
 ```bash
-bash install.sh --bundle ./wp-installer-v1.1.0.zip --check-only
+bash install.sh --bundle ./wp-installer-v1.2.0.zip --check-only
 ```
 
 Mode ini memerlukan Bash dan Python 3.10+. SHA256, keamanan path ZIP, kelengkapan
@@ -212,10 +213,10 @@ terpisah yang aksesnya dibatasi. Log panel tidak mencatat password.
 
 Menjalankan bootstrap lagi mengganti aplikasi secara atomik dan mempertahankan
 data situs serta backup. Paket server dan konten WordPress dikelola terpisah
-dari pembaruan aplikasi WPI. Untuk memperbarui instalasi v1.0.0, jalankan ulang
-perintah instalasi v1.1.0 di atas. Pada stack WPI yang sudah selesai disiapkan,
-bootstrap otomatis mengaktifkan pengelolaan PHP/FPM tanpa menginstal ulang
-WordPress atau meminta pengaturan tambahan.
+dari pembaruan aplikasi WPI. Untuk memperbarui instalasi v1.0.0 atau v1.1.0,
+jalankan ulang perintah instalasi v1.2.0 di atas. Pada stack WPI yang sudah
+selesai disiapkan, bootstrap otomatis mengaktifkan pengelolaan PHP/FPM tanpa
+menginstal ulang WordPress atau meminta pengaturan tambahan.
 
 ## PHP dan FPM otomatis
 
@@ -224,6 +225,15 @@ setiap 15 detik. PHP-FPM juga otomatis membuat worker sesuai permintaan dalam
 batas yang dihitung controller. Saat antrean meningkat dan resource masih
 tersedia, kapasitas dapat bertambah; ketika penggunaan turun atau memori
 menipis, kapasitas disesuaikan kembali. Perubahan diperiksa sebelum reload.
+
+RAM dan CPU efektif dihitung kembali pada setiap siklus. Ketika Ubuntu melihat
+resource tambahan setelah VPS di-upgrade, batas kapasitas ikut dihitung ulang.
+Worker bertambah bertahap ketika ada kebutuhan, bukan langsung memenuhi batas
+baru. Batas dihitung dari nilai yang lebih kecil antara delapan worker per CPU
+efektif dan anggaran memori proses PHP; tidak ada pembatas tetap 128 worker.
+Sebagai contoh perhitungan dengan proses ringan, 32 GiB/16 CPU dapat mencapai
+128 worker, sedangkan 128 GiB/64 CPU dapat mencapai 512 worker. Pemakaian memori
+worker yang lebih besar dapat menghasilkan batas lebih rendah.
 
 Jalankan `sudo wpi status` atau pilih menu **12** untuk melihat hasil pemantauan.
 Perintah status hanya membaca informasi, bukan mengubah konfigurasi. Detail

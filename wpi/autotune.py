@@ -301,7 +301,9 @@ def render_ini(resources):
 
 
 def render_pool(children, status_socket):
-    children = max(1, min(128, int(children)))
+    # The controller supplies a RAM/CPU-derived capacity. Preserve it here so
+    # larger servers can use their measured resources without an arbitrary cap.
+    children = max(1, int(children))
     spare_min = max(1, min(4, children // 4 or 1))
     spare_max = min(children, max(spare_min, min(8, children // 2 or 1)))
     start = min(children, max(spare_min, (spare_min + spare_max) // 2))
@@ -329,7 +331,7 @@ def capacity(resources):
     worker = max(96 * MIB, math.ceil(p90 * 1.25))
     memory_cap = max(1, budget // worker)
     cpu_cap = max(1, math.floor(max(0.1, resources.get('cpus', 1)) * 8))
-    return {'capacity': min(128, cpu_cap, memory_cap), 'worker_bytes': worker,
+    return {'capacity': min(cpu_cap, memory_cap), 'worker_bytes': worker,
             'memory_budget': budget, 'reserve_bytes': reserve + opcache}
 
 
@@ -378,8 +380,8 @@ def decide(resources, telemetry, state, now):
         idle_ticks = idle_ticks + 1 if quiet else 0
         if saturation >= 3 and elapsed >= GROW_COOLDOWN:
             candidate = min(bounds['capacity'], current + max(1, math.ceil(current * 0.25)))
-            # During a graceful reload old in-flight workers can coexist with
-            # the complete new pool. Reserve that transient footprint too.
+            # Keep conservative free-memory headroom for the replacement pool
+            # while the master waits for the current requests to finish.
             reload_room = max(0, available - headroom - profile(resources)['opcache_mib'] * MIB) // bounds['worker_bytes']
             candidate = min(candidate, reload_room)
             if cpu < 0.80 and candidate > current and resources.get('worker_rss'):
@@ -605,8 +607,8 @@ class AutoTuner:
         previous = {path: path.read_bytes() if path.exists() else None for path in changes}
         if all(previous[path] == value.encode('utf-8') for path, value in changes.items()):
             return False
-        # Never start another generation without RAM for its initial workers
-        # and shared OPcache. Existing in-flight workers can still be alive.
+        # Keep conservative RAM headroom for the replacement pool's initial
+        # workers and shared OPcache before requesting a graceful reload.
         settings = dict(re.findall(r'^(pm\.[a-z_]+) = (\d+)$', changes[self.pool], re.M))
         startup = int(settings['pm.start_servers']) * capacity(resources)['worker_bytes']
         startup += profile(resources)['opcache_mib'] * MIB + 32 * MIB

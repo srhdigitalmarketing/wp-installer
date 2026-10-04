@@ -19,6 +19,15 @@ penahanan kenaikan saat CPU penuh, penurunan saat memori menipis, jeda antar
 reload, serta pemulihan konfigurasi setelah validasi/reload gagal. Data status
 yang tidak tersedia harus menghasilkan keputusan konservatif.
 
+Untuk v1.2.0, data uji juga harus membuktikan kapasitas dapat melewati 128 worker
+ketika resource mencukupi: 128 GiB/64 CPU dengan proses ringan mempunyai batas
+512 worker, sedangkan RSS 200 MiB ditambah headroom 25% membatasi kapasitas
+menjadi 262 worker. Simulasikan perubahan dari 32 GiB/16 CPU ke 128 GiB/64 CPU
+untuk memastikan resource dibaca ulang dan kapasitas bertambah sesuai kebutuhan
+berkelanjutan. Penurunan batas resource harus tetap mengurangi target kapasitas.
+Angka tersebut adalah tes kebijakan dengan resource buatan, bukan pengujian
+512 proses produksi sungguhan.
+
 ## Integrasi Ubuntu sekali pakai
 
 `tests/integration.sh` hanya boleh dijalankan di VM CI sekali pakai. Skrip ini
@@ -74,6 +83,7 @@ perubahan domain.
 | PHP/FPM otomatis | Resource server terbaca, konfigurasi PHP/FPM valid, pemantauan hanya dapat diakses lokal, timer aktif sesudah reboot, dan status menampilkan keputusan terakhir. |
 | Lonjakan request PHP | Gunakan beban PHP terkontrol pada VM uji; ketika antrean/worker sibuk meningkat dan masih ada resource, batas worker bertambah. Setelah beban turun, kapasitas kembali disesuaikan tanpa reload setiap sampel. |
 | Batas resource | Pada VM/container dengan batas RAM/CPU, target kapasitas mengikuti batas yang dihitung; tekanan memori menurunkan kapasitas jika reload aman dan CPU penuh menahan kenaikan. Headroom resource diperiksa sebelum penerapan konfigurasi. WordPress tetap dapat diakses setelah reload selesai. |
+| Upgrade resource VPS | Tambahkan RAM/CPU pada VM uji, reboot jika penyedia memerlukannya, lalu periksa resource efektif yang terlihat di Ubuntu dan status controller. Batas kapasitas dihitung ulang, dapat melewati 128 bila perhitungan mengizinkan, dan bertambah bertahap ketika beban membutuhkan. Penambahan resource sendiri tidak langsung menjalankan seluruh kapasitas worker. |
 | Pemulihan FPM | Simulasikan kegagalan validasi/reload di VM uji; konfigurasi sebelumnya dipulihkan, kegagalan tercatat tanpa kredensial, dan controller mencoba lagi pada siklus berikutnya. |
 
 Catat versi Ubuntu, stack, output pemeriksaan konfigurasi, status HTTP, dan hasil

@@ -180,6 +180,22 @@ def verify_real_fpm_congestion(site):
         with tuner._lock(blocking=True):
             old_children = tuner._state()['children']
             actual_resources = autotune.detect_resources()
+            # Validate a ceiling above the old hard limit with real PHP-FPM.
+            # Syntax checks do not signal/reload the running server or spawn
+            # 512 workers; the fixture restores the original file immediately.
+            original_pool = tuner.pool.read_bytes()
+            try:
+                larger_pool = autotune.render_pool(512, tuner.status_socket)
+                assert 'pm.max_children = 512\n' in larger_pool
+                startup = re.search(r'^pm.start_servers = (\d+)$', larger_pool, re.M)
+                assert startup and int(startup[1]) <= 6
+                autotune._atomic_write(tuner.pool, larger_pool, 0o644)
+                subprocess.run([f'/usr/sbin/php-fpm{manager.config["php_version"]}', '-t'],
+                               check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            finally:
+                autotune._atomic_write(tuner.pool, original_pool, 0o644)
+            print('Real PHP-FPM accepted pm.max_children=512 with at most 6 startup workers; '
+                  'syntax-only validation, no 512-worker generation was activated.', flush=True)
             tuner._apply(2, actual_resources, update_ini=False)
             time.sleep(1)
             slow.write_text('<?php usleep(8000000); echo "wpi-ci-slow"; ?>', encoding='utf-8')

@@ -185,6 +185,66 @@ class AdaptivePolicyTests(unittest.TestCase):
         }), children=16, count=60)
         self.assertTrue(all(result["children"] == 16 for result in decisions), decisions)
 
+    def test_live_hardware_resize_allows_demand_to_grow_beyond_128(self):
+        before = resources(memory_total=32 * autotune.GIB,
+                           memory_available=28 * autotune.GIB,
+                           cpus=16.0, host_cpus=16, worker_rss=[64 * MiB])
+        after = resources(memory_total=128 * autotune.GIB,
+                          memory_available=112 * autotune.GIB,
+                          cpus=64.0, host_cpus=64, worker_rss=[64 * MiB])
+        state = {"children": 128, "last_change": 0, "saturation_ticks": 2,
+                 "idle_ticks": 0, "pressure_ticks": 0}
+        unchanged = autotune.decide(before, telemetry(128), state, 1000)
+        self.assertEqual(unchanged["children"], 128)
+        state.update(unchanged)
+        grown = autotune.decide(after, telemetry(128), state, 1015)
+        self.assertEqual(grown["capacity"], 512)
+        self.assertGreater(grown["children"], 128)
+        self.assertLessEqual(grown["children"], grown["capacity"])
+
+    def test_large_server_growth_still_requires_ram_cpu_and_worker_measurements(self):
+        large = resources(memory_total=128 * autotune.GIB,
+                          memory_available=112 * autotune.GIB,
+                          cpus=64.0, host_cpus=64, worker_rss=[64 * MiB])
+        for changes in ({"cpu_load": 0.85}, {"memory_available": 18 * autotune.GIB},
+                        {"worker_rss": []}, {"telemetry_ok": False}):
+            with self.subTest(changes=changes):
+                decisions = self.exercise({**large, **changes}, telemetry(128), children=128)
+                self.assertTrue(all(decision["children"] <= 128 for decision in decisions), decisions)
+
+    def test_resource_pressure_and_hardware_downsize_reduce_large_pool(self):
+        large = resources(memory_total=128 * autotune.GIB,
+                          memory_available=112 * autotune.GIB,
+                          cpus=64.0, host_cpus=64, worker_rss=[64 * MiB])
+        state = {"children": 512, "last_change": 0, "saturation_ticks": 0,
+                 "idle_ticks": 0, "pressure_ticks": 0}
+        pressure = autotune.decide({**large, "memory_available": 1 * autotune.GIB},
+                                   telemetry(512), state, 1000)
+        self.assertLess(pressure["children"], 512)
+        smaller = {**large, "memory_total": 32 * autotune.GIB,
+                   "memory_available": 28 * autotune.GIB, "cpus": 16.0, "host_cpus": 16}
+        downsize = autotune.decide(smaller, telemetry(512), state, 1000)
+        self.assertEqual(downsize["children"], 128)
+        self.assertEqual(downsize["reason"], "capacity-limit")
+
+
+class HardwareCapacityTests(unittest.TestCase):
+    def test_cpu_bound_scales_past_previous_fixed_ceiling(self):
+        for memory_gib, cpus, expected in ((32, 16, 128), (128, 64, 512), (256, 128, 1024)):
+            with self.subTest(memory_gib=memory_gib, cpus=cpus):
+                sample = resources(memory_total=memory_gib * autotune.GIB,
+                                   cpus=float(cpus), host_cpus=cpus, worker_rss=[64 * MiB])
+                self.assertEqual(autotune.capacity(sample)["capacity"], expected)
+
+    def test_measured_heavy_workers_lower_large_server_memory_bound(self):
+        for rss_mib, expected in ((200, 262), (1024, 51)):
+            with self.subTest(rss_mib=rss_mib):
+                sample = resources(memory_total=128 * autotune.GIB, cpus=64.0,
+                                   host_cpus=64, worker_rss=[rss_mib * MiB])
+                bounds = autotune.capacity(sample)
+                self.assertEqual(bounds["capacity"], expected)
+                self.assertLessEqual(bounds["capacity"] * bounds["worker_bytes"], bounds["memory_budget"])
+
 
 class ResourceDetectionTests(unittest.TestCase):
     def setUp(self):
@@ -266,7 +326,7 @@ class ResourceDetectionTests(unittest.TestCase):
 
 class PoolRenderingTests(unittest.TestCase):
     def test_dynamic_process_counts_are_valid_even_on_tiny_servers(self):
-        for children in (1, 2, 3, 8, 32):
+        for children in (1, 2, 3, 8, 32, 128, 256, 512, 1024):
             with self.subTest(children=children):
                 body = autotune.render_pool(children, "/run/private/status.sock")
                 settings = {}
@@ -283,6 +343,9 @@ class PoolRenderingTests(unittest.TestCase):
                 self.assertLessEqual(int(settings["pm.max_spare_servers"]), children)
                 self.assertEqual(settings["pm.status_listen"], "/run/private/status.sock")
                 self.assertGreater(int(settings["pm.max_requests"]), 0)
+                # A higher ceiling must not preallocate hundreds of processes.
+                self.assertLessEqual(int(settings["pm.start_servers"]), 6)
+                self.assertLessEqual(int(settings["pm.max_spare_servers"]), 8)
 
 
 class ConfigurationTransactionTests(unittest.TestCase):
@@ -384,6 +447,59 @@ class ConfigurationTransactionTests(unittest.TestCase):
         self.assertEqual(report["reason"], "reload-failed")
         self.assertEqual(self.tuner._state()["children"], 4)
         self.assertEqual(self.tuner._state()["last_change"], 0)
+
+    def test_tick_redetects_resized_hardware_and_preserves_reload_generation_hold(self):
+        clock = [1000]
+        self.tuner.clock = lambda: clock[0]
+
+        def write_hardware(memory_gib, cpus, counter):
+            proc = self.tuner.proc
+            ResourceDetectionTests.write(proc / "meminfo",
+                f"MemTotal: {memory_gib * 1024 * 1024} kB\n"
+                f"MemAvailable: {(memory_gib * 7 // 8) * 1024 * 1024} kB\n")
+            ResourceDetectionTests.write(proc / "stat",
+                f"cpu  {counter // 5} 0 0 {counter * 4 // 5} 0 0 0 0 0 0\n" +
+                "".join(f"cpu{number} 25 0 25 200 0 0 0 0 0 0\n" for number in range(cpus)))
+            ResourceDetectionTests.write(proc / "vmstat", "pswpin 0\npswpout 0\n")
+            ResourceDetectionTests.write(proc / "pressure/memory",
+                                         "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+            ResourceDetectionTests.write(proc / "self/cgroup", "")
+            ResourceDetectionTests.write(proc / "100/status", "VmRSS: 65536 kB\n")
+            (proc / "100/cmdline").write_bytes(b"php-fpm: pool www\0")
+
+        write_hardware(32, 16, 10000)
+        self.tuner._save({
+            "children": 128, "last_change": 0, "saturation_ticks": 2,
+            "idle_ticks": 0, "pressure_ticks": 0,
+            "profile": autotune.profile(resources(memory_total=32 * autotune.GIB)),
+            "sample": {"time": 985, "cpu_total": 9500, "cpu_idle": 7600,
+                       "cgroup_cpu_usec": None, "swap_in": 0, "swap_out": 0},
+        })
+        with mock.patch.object(autotune, "read_fpm_status", return_value=telemetry(128)), \
+             mock.patch.object(autotune, "read_socket_queue", return_value=8):
+            before = self.tuner.tick()
+            self.assertEqual(before["capacity"], 128)
+            self.assertEqual(before["children"], 128)
+            self.assertEqual(self.calls, [])
+
+            clock[0] = 1015
+            write_hardware(128, 64, 11000)
+            after = self.tuner.tick()
+            self.assertEqual(after["memory_total_mib"], 128 * 1024)
+            self.assertEqual(after["effective_cpus"], 64)
+            self.assertEqual(after["capacity"], 512)
+            self.assertGreater(after["children"], 128)
+            self.assertIn(f"pm.max_children = {after['children']}\n", self.tuner.pool.read_text())
+            self.assertTrue(after["reload_pending"])
+            self.assertEqual(self.calls, [["/usr/sbin/php-fpm8.3", "-t"],
+                                         ["systemctl", "reload", "php8.3-fpm"]])
+
+            clock[0] = 1030
+            write_hardware(128, 64, 12000)
+            waiting = self.tuner.tick()
+            self.assertEqual(waiting["reason"], "reload-pending")
+            self.assertEqual(waiting["children"], after["children"])
+            self.assertEqual(len(self.calls), 2)
 
 
 class UnixBacklogTests(unittest.TestCase):
