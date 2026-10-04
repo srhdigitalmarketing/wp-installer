@@ -7,6 +7,8 @@ WPI mengatur server web, PHP-FPM, database, WordPress, virtual host, dan HTTPS.
 [Tonton / unduh video demo CLI (MP4, 1080p)](https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.0.0/WPI-demo-Indonesia.mp4)
 — 2 menit 22 detik, narasi Indonesia dan subtitle. Video menggunakan menu/prompt
 asli dengan backend simulasi serta domain contoh; tidak memasang VPS produksi.
+Video merekam v1.0.0. Pengelolaan Alias dan Set as Primary pada v1.3.0 mengikuti
+panduan terbaru di bawah; perilakunya berbeda dari rekaman lama.
 
 ## Fitur
 
@@ -19,13 +21,14 @@ asli dengan backend simulasi serta domain contoh; tidak memasang VPS produksi.
   batas tetap 128 worker. Tidak perlu mengisi nilai PHP/FPM secara manual.
 - Beberapa situs, masing-masing memiliki direktori WordPress, database, dan
   akun database tersendiri.
-- Tambah secondary domain dengan redirect permanen **301** ke primary.
-  Path dan query dipertahankan, misalnya `alias.com/artikel?x=1` menjadi
-  `utama.com/artikel?x=1`.
-- Ganti primary domain: backup terlebih dahulu, sesuaikan URL WordPress dan
-  tautan di database menggunakan WP-CLI, terbitkan SSL untuk domain baru,
-  lalu ubah konfigurasi web. Domain primary lama otomatis dilepas dari vhost
-  dan pengelolaan SSL WPI.
+- **Add domain**: pilih **Alias** untuk membuka situs WordPress yang sama pada
+  domain tambahan, atau **Redirect** untuk pengalihan permanen **301** ke primary.
+  Untuk domain tanpa www, pilihan **www** menambahkan hostname www juga.
+- **Set as Primary**: pilih Alias yang sudah terpasang. WPI membuat backup dan
+  menyesuaikan URL WordPress serta tautan database menggunakan WP-CLI, termasuk
+  data terserialisasi. Primary lama menjadi Alias secara standar.
+- **Delete domain**: melepas Alias atau Redirect dan SSL hostname tersebut;
+  aplikasi, file WordPress, serta database tetap tersedia.
 - Pasang phpMyAdmin pada domain/subdomain tersendiri dengan HTTPS dan
   Basic Auth tambahan. Hapus phpMyAdmin hanya melepas antarmuka web tersebut;
   **database dan situs WordPress tetap ada**.
@@ -48,7 +51,8 @@ atau installer lain. Gunakan VM terpisah jika sudah ada panel hosting.
 
 Sebelum memasang situs atau phpMyAdmin:
 
-1. Buat DNS **A** untuk hostname yang digunakan, menuju IPv4 publik server.
+1. Buat DNS **A** untuk setiap hostname yang digunakan, menuju IPv4 publik
+   server. Jika menambahkan www, siapkan DNS untuk kedua hostname tersebut.
 2. Jika ada DNS **AAAA**, arahkan ke IPv6 server yang dapat diakses. Hapus AAAA
    yang salah jika server tidak menyediakan IPv6.
 3. Buka TCP **80 dan 443** pada firewall server, security group, dan router.
@@ -70,12 +74,12 @@ sudo apt-get update
 sudo apt-get install -y curl ca-certificates
 
 curl -fL --proto '=https' --proto-redir '=https' \
-  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.2.2/install.sh \
+  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.3.0/install.sh \
   -o install.sh
 curl -fL --proto '=https' --proto-redir '=https' \
-  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.2.2/install.sh.sha256 \
+  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.3.0/install.sh.sha256 \
   -o install.sh.sha256
-sha256sum --check install.sh.sha256 && sudo bash install.sh --version v1.2.2
+sha256sum --check install.sh.sha256 && sudo bash install.sh --version v1.3.0
 
 sudo wpi
 ```
@@ -88,25 +92,25 @@ percaya atau tinjau kode pada tag versi tersebut.
 
 ### Memakai bundle lokal
 
-Unduh `wp-installer-v1.2.2.zip` dan `wp-installer-v1.2.2.zip.sha256`
-dari [release v1.2.2](https://github.com/srhdigitalmarketing/wp-installer/releases/tag/v1.2.2),
+Unduh `wp-installer-v1.3.0.zip` dan `wp-installer-v1.3.0.zip.sha256`
+dari [release v1.3.0](https://github.com/srhdigitalmarketing/wp-installer/releases/tag/v1.3.0),
 lalu salin ke server bersama `install.sh`.
 
 ```bash
-sudo bash install.sh --bundle ./wp-installer-v1.2.2.zip
+sudo bash install.sh --bundle ./wp-installer-v1.3.0.zip
 sudo wpi
 ```
 
 Hash yang diperoleh secara terpisah juga dapat diberikan melalui `--sha256`:
 
 ```bash
-sudo bash install.sh --bundle ./wp-installer-v1.2.2.zip --sha256 HASH_SHA256_RILIS
+sudo bash install.sh --bundle ./wp-installer-v1.3.0.zip --sha256 HASH_SHA256_RILIS
 ```
 
 Validasi bundle tanpa pemasangan, tanpa akses root, dan tanpa jaringan:
 
 ```bash
-bash install.sh --bundle ./wp-installer-v1.2.2.zip --check-only
+bash install.sh --bundle ./wp-installer-v1.3.0.zip --check-only
 ```
 
 Mode ini memerlukan Bash dan Python 3.10+. SHA256, keamanan path ZIP, kelengkapan
@@ -124,27 +128,45 @@ kredensial yang ditampilkan setelah pemasangan di pengelola password.
 | Nomor | Menu | Nomor | Menu |
 | --- | --- | --- | --- |
 | 1 | Install WordPress | 2 | Daftar situs dan domain |
-| 3 | Add domain | 4 | Change primary domain |
-| 5 | Delete secondary domain | 6 | Install phpMyAdmin |
+| 3 | Add domain | 4 | Set as Primary |
+| 5 | Delete domain | 6 | Install phpMyAdmin |
 | 7 | Delete panel phpMyAdmin | 8 | Backup situs dan database |
 | 9 | Restore backup | 10 | SSL / perbaiki SSL |
 | 11 | Update WordPress core | 12 | Status dan diagnosis |
 | 13 | Lihat kredensial situs | 14 | Lanjutkan instalasi gagal |
 | 0 | Keluar | | |
 
-Untuk secondary domain, pilih situs primary lalu masukkan hostname secondary.
-Setiap hostname harus mempunyai DNS yang benar agar SSL dan redirect HTTPS
-berfungsi. Secondary tidak membuat salinan WordPress atau database baru.
+Setiap situs mempunyai satu **Primary**. Pada menu **3 — Add domain**, pilih
+situs, masukkan domain baru, lalu pilih **Alias** atau **Redirect**. Alias adalah
+pilihan standar dan membuka situs WordPress yang sama pada domain tambahan.
+Redirect mengirim pengunjung ke primary dengan kode 301, mempertahankan path
+dan query, misalnya `tambahan.com/artikel?x=1` menuju
+`utama.com/artikel?x=1`. Keduanya memakai file dan database situs yang sama.
 
-Untuk mengganti primary, arahkan domain baru ke server sebelum menjalankan menu
-pergantian. WPI memperbarui `home`, `siteurl`, serta URL di tabel situs dengan
-penanganan data PHP yang terserialisasi. Tautan yang ditulis langsung di file
-tema/plugin atau layanan eksternal perlu disesuaikan di sumbernya.
+Untuk menambahkan `example.net` dan `www.example.net` bersamaan, masukkan
+`example.net` lalu jawab **Ya** pada pertanyaan www. DNS kedua hostname harus
+menunjuk server. WPI menyiapkan konfigurasi web dan SSL setiap hostname secara
+otomatis; jika pemasangan salah satu hostname gagal, pasangan baru dibatalkan.
+
+Pada Alias, alamat dan tautan yang dihasilkan WordPress mengikuti domain Alias
+yang sedang dibuka. Tautan yang sudah tertulis di konten, tema/plugin, atau
+layanan eksternal masih dapat menuju primary; menambah Alias tidak mengganti
+seluruh tautan yang sudah tersimpan.
+
+Untuk mengganti primary melalui menu **4 — Set as Primary**, tambahkan domain
+baru sebagai Alias terlebih dahulu, lalu pilih Alias tersebut. WPI membuat
+backup dan memperbarui `home`, `siteurl`, serta URL di tabel situs dengan
+penanganan data PHP yang terserialisasi. Primary lama tetap terpasang sebagai
+Alias. Tautan yang ditulis langsung di file tema/plugin atau layanan eksternal
+perlu disesuaikan di sumbernya.
 [WP-CLI search-replace](https://developer.wordpress.org/cli/commands/search-replace/)
 
-Menghapus domain secondary melepas konfigurasi hostname tersebut dari server.
-Mengganti atau melepas domain di WPI tidak mengubah registrasi domain maupun
-record DNS pada penyedia DNS.
+Menu **5 — Delete domain** melepas satu hostname Alias atau Redirect dari
+konfigurasi situs dan pengelolaan SSL. File WordPress dan database tetap ada.
+Primary tidak dapat dihapus sebelum Alias lain dijadikan primary. Untuk
+pasangan tanpa www dan www, masing-masing hostname dapat dilepas terpisah.
+Mengganti atau melepas domain di WPI tidak mengubah registrasi maupun record
+DNS pada penyedia DNS.
 
 phpMyAdmin menggunakan hostname khusus, contohnya `db.example.com`. Pertama
 masukkan akun Basic Auth panel, kemudian login menggunakan akun database situs.
@@ -166,9 +188,11 @@ sudo wpi setup --stack nginx --database mariadb
 
 sudo wpi install example.com --email admin@example.com
 sudo wpi list
-sudo wpi add-domain example.com alias.example.com
-sudo wpi change-domain example.com example.net
-sudo wpi delete-domain example.net alias.example.com
+# Alias adalah pilihan standar; --www menambahkan example.net dan www.example.net.
+sudo wpi add-domain example.com example.net --type alias --www
+sudo wpi add-domain example.com redirect.example.com --type redirect
+sudo wpi set-primary example.com example.net
+sudo wpi delete-domain example.net redirect.example.com
 
 sudo wpi pma-install db.example.net --email admin@example.net
 sudo wpi pma-delete
@@ -177,7 +201,18 @@ sudo wpi backup example.net
 sudo wpi ssl example.net
 sudo wpi update example.net
 sudo wpi status
+sudo wpi lock-status
 ```
+
+Pada `set-primary`, `--old-domain alias` adalah pilihan standar. Gunakan
+`--old-domain redirect` untuk menjadikan primary lama Redirect 301, atau
+`--old-domain remove` untuk melepasnya setelah pergantian selesai. Contoh:
+`sudo wpi set-primary example.com example.net --old-domain redirect`.
+
+Perintah kompatibilitas `sudo wpi change-domain SITE DOMAIN_BARU` tetap dapat
+dipakai untuk mengganti primary dan melepas primary lama, seperti versi
+sebelumnya. Perintah ini berbeda dari menu Set as Primary yang mempertahankan
+domain lama secara standar.
 
 Restore memakai path folder backup lengkap yang ditampilkan oleh perintah
 backup: `sudo wpi restore SITE /var/backups/wpi/ID/FOLDER_BACKUP`.
@@ -215,28 +250,53 @@ Menjalankan bootstrap lagi mengganti aplikasi secara atomik dan mempertahankan
 data situs serta backup. Paket server dan konten WordPress dikelola terpisah
 dari pembaruan aplikasi WPI. Untuk memperbarui instalasi versi sebelumnya,
 tutup menu lama yang sedang menunggu pilihan dengan **0**, lalu jalankan ulang
-perintah instalasi v1.2.2 di atas. Tunggu operasi yang sedang berjalan selesai
+perintah instalasi v1.3.0 di atas. Tunggu operasi yang sedang berjalan selesai
 sebelum menutup panel. Pada stack WPI yang sudah
 selesai disiapkan, bootstrap otomatis mengaktifkan pengelolaan PHP/FPM tanpa
 menginstal ulang WordPress atau meminta pengaturan tambahan.
+
+Upgrade ke v1.3.0 mempertahankan domain dan data yang sudah terpasang. Domain
+secondary versi sebelumnya tetap menjadi Redirect 301; domain tersebut tidak
+otomatis diubah menjadi Alias. Add domain baru memakai Alias secara standar.
 
 ### Panel atau operasi WPI sedang berjalan
 
 Versi hingga v1.2.0 mengunci seluruh sesi panel, termasuk saat menunggu pilihan.
 Pesan `Panel WPI lain sedang berjalan. Tutup panel tersebut dahulu.` dapat
 muncul ketika panel lama masih terbuka di terminal atau sesi SSH lain. Tutup
-panel tersebut dengan **0** saat sudah kembali ke menu, lalu pasang v1.2.2.
+panel tersebut dengan **0** saat sudah kembali ke menu, lalu pasang v1.3.0.
 
 Mulai v1.2.1, menu, prompt, `sudo wpi list`, dan `sudo wpi status` tidak menahan
 kunci operasi. Beberapa panel dapat dibuka bersamaan; operasi yang mengubah
 situs atau konfigurasi tetap dijalankan satu per satu. Jika operasi lain sedang
 berjalan, tunggu hingga selesai dan ulangi pilihan Anda.
 
-Untuk melihat proses yang memegang kunci, jalankan pemeriksaan berikut:
+Pesan `Operasi WPI lain sedang berjalan` saat **Add domain** berarti kunci
+sedang digunakan. Alur Add domain mengambil satu kunci sesudah
+input selesai; diagnosis di server tetap diperlukan untuk membedakan operasi
+aktif dari panel versi lama yang masih terbuka. Upgrade aplikasi tidak menutup
+proses panel lama yang sudah berjalan.
+
+Mulai v1.3.0, pemeriksaan berikut menampilkan status kunci beserta PID dan nama
+proses yang dikonfirmasi melalui informasi kunci kernel. Perintah ini hanya
+membaca status dan tetap dapat dijalankan ketika kunci sedang digunakan:
+
+```bash
+sudo wpi --version
+sudo wpi lock-status
+```
+
+Jika pemegang tidak dapat ditemukan, status akan melaporkan informasi tidak
+tersedia; hal tersebut tidak membuktikan kunci bebas. Pemeriksaan tambahan:
 
 ```bash
 sudo lslocks -o PID,COMMAND,PATH | grep '/var/lib/wpi/operation.lock'
 ```
+
+Gunakan hasil diagnosis untuk menemukan terminal atau sesi SSH pemegang kunci.
+Keluar dengan **0** hanya ketika panel sudah kembali ke menu; tunggu instalasi,
+backup, atau perubahan domain yang masih berjalan hingga selesai. WPI tidak
+otomatis menutup proses atau melewati kunci tersebut.
 
 File `/var/lib/wpi/operation.lock` tetap ada setelah panel ditutup; keberadaan
 file tersebut adalah normal. **Jangan hapus file kunci.** Kunci dilepas otomatis

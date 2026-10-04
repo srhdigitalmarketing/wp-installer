@@ -24,6 +24,7 @@ from PIL import Image, ImageDraw, ImageFont
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from wpi import cli
+from wpi import __version__
 
 WIDTH, HEIGHT = 1920, 1080
 BG, PANEL = '#0b1120', '#121c2e'
@@ -40,26 +41,67 @@ class DemoManager:
         return self.items
 
     def site(self, identifier):
-        return next(s for s in self.items if identifier in [s['id'], s['primary'], *s['secondary']])
+        return next(s for s in self.items if identifier in [
+            s['id'], s['primary'], *s['aliases'], *s['secondary']])
 
     def setup(self, stack, database):
         print('Menginstal web server, PHP-FPM, database, Certbot, dan WP-CLI...')
         self.config = {'stack': stack, 'database': database, 'php_version': '8.3'}
 
     def install(self, host, email, title, admin, password):
-        site = {'id': 'a1b2c3d4e5f6', 'primary': host, 'secondary': [], 'status': 'active', 'admin': admin}
+        site = {'id': 'a1b2c3d4e5f6', 'primary': host, 'aliases': [],
+                'secondary': [], 'status': 'active', 'admin': admin}
         self.items.append(site)
         return site, '[disamarkan untuk video]'
 
     def add_secondary(self, identifier, host):
+        return self.add_domain(identifier, host, kind='redirect')
+
+    def add_domain(self, identifier, host, kind='alias', www=False):
+        if kind not in ('alias', 'redirect'):
+            raise ValueError('Jenis domain harus alias atau redirect.')
         site = self.site(identifier)
-        site['secondary'].append(host)
+        role = 'aliases' if kind == 'alias' else 'secondary'
+        hosts = [host]
+        if www:
+            hosts.append('www.' + host)
+        for domain in hosts:
+            if domain not in site[role]:
+                site[role].append(domain)
         return site
 
     def change_primary(self, identifier, host):
         site = self.site(identifier)
+        if host in site['aliases']:
+            site['aliases'].remove(host)
+        if host in site['secondary']:
+            site['secondary'].remove(host)
         site['primary'] = host
         return site, self.backup(identifier)
+
+    def set_primary(self, identifier, host, old_domain='alias'):
+        site = self.site(identifier)
+        if host not in site['aliases']:
+            raise ValueError('Tambahkan domain sebagai Alias sebelum Set as Primary.')
+        if old_domain not in ('alias', 'redirect', 'remove'):
+            raise ValueError('Pilihan domain lama tidak valid.')
+        old = site['primary']
+        site, backup = self.change_primary(identifier, host)
+        if old_domain != 'remove':
+            site['aliases' if old_domain == 'alias' else 'secondary'].append(old)
+        return site, backup
+
+    def remove_domain(self, identifier, host):
+        site = self.site(identifier)
+        if host == site['primary']:
+            raise ValueError('Set as Primary domain lain terlebih dahulu.')
+        for role in ('aliases', 'secondary'):
+            if host in site[role]:
+                site[role].remove(host)
+        return site
+
+    def remove_secondary(self, identifier, host):
+        return self.remove_domain(identifier, host)
 
     def backup(self, identifier):
         return PurePosixPath('/var/backups/wpi/a1b2c3d4e5f6/20261004T030000-a1b2c3')
@@ -102,21 +144,8 @@ def build_scenes():
     install = capture(lambda: cli.install_interactive(manager),
                       ['example.com', 'admin@example.com', 'Situs Demo', 'wpadmin', '1', '1'])
 
-    def secondary():
-        site = manager.add_secondary(cli.select_site(manager), cli.ask('Domain secondary baru'))
-        print('Secondary terpasang -> https://' + site['primary'] + ' (301).')
-
-    secondary_text = capture(secondary, ['', 'alias.example.com'])
-
-    def change():
-        identifier = cli.select_site(manager)
-        host = cli.ask('Domain primary baru')
-        cli.confirm('URL database akan diganti, domain primary lama dilepas. Backup otomatis dibuat.', host)
-        site, backup = manager.change_primary(identifier, host)
-        print(f'Primary: {site["primary"]}\nBackup: {backup}')
-        cli.show_sites(manager)
-
-    change_text = capture(change, ['', 'example.net', 'example.net'])
+    domain_text = capture(lambda: cli.add_domain_interactive(manager), ['', 'example.net', '', ''])
+    change_text = capture(lambda: cli.set_primary_interactive(manager), ['', 'example.net', 'example.net'])
     pma_install = capture(lambda: cli.pma_interactive(manager), ['db.example.net', 'admin@example.net', 'panel'])
 
     def remove_pma():
@@ -146,12 +175,12 @@ def build_scenes():
              lines=['# Contoh perintah instalasi di Ubuntu', '',
                     'sudo apt-get update', 'sudo apt-get install -y curl ca-certificates', '',
                     'WPI_URL="https://github.com/srhdigitalmarketing/\\',
-                    'wp-installer/releases/download/v1.0.0"', '',
+                    f'wp-installer/releases/download/v{__version__}"', '',
                     'curl -fL "$WPI_URL/install.sh" -o install.sh',
                     'curl -fL "$WPI_URL/install.sh.sha256" -o install.sh.sha256', '',
                     'sha256sum --check install.sh.sha256 && \\',
-                    'sudo bash install.sh --version v1.0.0', '', 'sudo wpi'],
-             facts=['Hosting script gratis', 'GitHub Releases v1.0.0', 'Checksum SHA256', 'Bundle aplikasi diperiksa', 'sebelum dipasang.']),
+                    f'sudo bash install.sh --version v{__version__}', '', 'sudo wpi'],
+             facts=['Hosting script gratis', f'GitHub Releases v{__version__}', 'Checksum SHA256', 'Bundle aplikasi diperiksa', 'sebelum dipasang.']),
         dict(title='Satu panel, semua operasi', label='PANEL CLI', minimum=13,
              caption='Pilih nomor menu untuk instalasi, domain, phpMyAdmin, dan backup.',
              lines=menu.splitlines(), facts=['Menu CLI asli', 'Ditampilkan dari wpi/cli.py', '14 pilihan operasi', 'Install · domain · SSL', 'Backup · status · recovery']),
@@ -159,16 +188,16 @@ def build_scenes():
              caption='Isi domain dan akun admin, lalu pilih web server serta database.',
              lines=['Masukkan nomor: 1', *install.splitlines()],
              facts=['Contoh pilihan', 'Nginx + MariaDB', 'Pilihan lainnya', 'Apache + MySQL', 'Konfigurasi otomatis', 'PHP-FPM · WordPress · SSL']),
-        dict(title='Tambahkan domain secondary', label='MENU 3', minimum=16,
-             caption='Redirect 301 mempertahankan path artikel dan parameter query.',
-             lines=['Masukkan nomor: 3', *secondary_text.splitlines(), '',
-                    '# Hasil yang diharapkan — simulasi', 'https://alias.example.com/artikel?x=1',
-                    '  301 -> https://example.com/artikel?x=1'],
-             facts=['Secondary', 'alias.example.com', '301 → Primary', 'example.com', 'Path + query tetap', '/artikel?x=1']),
-        dict(title='Ganti domain primary', label='MENU 4', minimum=20,
-             caption='Backup otomatis, replace URL database, lalu lepas domain primary lama.',
+        dict(title='Tambahkan domain Alias atau Redirect', label='MENU 3', minimum=16,
+             caption='Pilih Alias untuk aplikasi yang sama, atau Redirect untuk 301 ke Primary.',
+             lines=['Masukkan nomor: 3', *domain_text.splitlines(), '',
+                    '# Konfigurasi yang diharapkan — simulasi', 'example.net: Alias aplikasi WordPress',
+                    'Alias dapat dipilih menjadi Primary pada menu 4.'],
+             facts=['Alias baru', 'example.net', 'Pilihan lainnya', 'Redirect 301 → Primary', 'www opsional', 'DNS dan SSL diperiksa.']),
+        dict(title='Set as Primary dari daftar Alias', label='MENU 4', minimum=20,
+             caption='Backup otomatis dan replace URL database; domain primary lama tetap menjadi Alias.',
              lines=['Masukkan nomor: 4', *change_text.splitlines()],
-             facts=['Primary baru', 'example.net', 'Primary lama dilepas', 'example.com', 'Database URL diganti', 'Data terserialisasi ditangani', 'Tautan dalam file tema', 'disesuaikan di sumbernya.']),
+             facts=['Primary baru', 'example.net', 'Primary lama tetap Alias', 'example.com', 'Database URL diganti', 'Data terserialisasi ditangani', 'Tautan dalam file tema', 'disesuaikan di sumbernya.']),
         dict(title='Kelola panel phpMyAdmin', label='MENU 6 + 7', minimum=24,
              caption='Hapus akses phpMyAdmin tetap mempertahankan database WordPress.',
              lines=['Masukkan nomor: 6', *pma_install.splitlines(), '', 'Masukkan nomor: 7', *pma_delete.splitlines()],

@@ -54,6 +54,12 @@ def email_address(value):
     return value
 
 
+def site_hosts(site):
+    """All managed hostnames; legacy secondary entries remain redirects."""
+    return list(dict.fromkeys([site['primary'], *site.get('aliases', []),
+                               *site.get('secondary', [])]))
+
+
 def atomic_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -126,14 +132,14 @@ class Manager:
 
     def site(self, identifier):
         for site in self.sites():
-            if identifier in [site['id'], site['primary'], *site['secondary']]:
+            if identifier in [site['id'], *site_hosts(site)]:
                 return site
         raise ValueError('Situs tidak ditemukan. Lihat menu daftar situs.')
 
     def ensure_free_domain(self, host, allow_site=None):
         host = domain(host)
         for site in self.sites():
-            if host in [site['primary'], *site['secondary']] and site['id'] != allow_site:
+            if host in site_hosts(site) and site['id'] != allow_site:
                 raise ValueError(f'Domain {host} sudah dipakai situs lain.')
         pma = self.config.get('phpmyadmin', {})
         if host == pma.get('domain'):
@@ -280,7 +286,7 @@ class Manager:
         root = WWW / ident / 'public'
         if root.parent.exists():
             raise ValueError('Direktori situs sudah ada.')
-        site = {'id': ident, 'primary': host, 'secondary': [], 'root': str(root), 'tls': [],
+        site = {'id': ident, 'primary': host, 'aliases': [], 'secondary': [], 'root': str(root), 'tls': [],
                 'email': email, 'db_name': f'wpi_{ident}', 'db_user': f'wpi_{ident}',
                 'admin': admin, 'title': title, 'created_at': dt.datetime.now(dt.timezone.utc).isoformat(), 'status': 'installing'}
         root.mkdir(parents=True, mode=0o755)
@@ -374,23 +380,65 @@ class Manager:
         self.retry_install_ssl(identifier)
         return self.site(identifier), credentials['wordpress_password']
 
-    def add_secondary(self, identifier, host):
-        host = self.ensure_free_domain(host)
+    def add_domain(self, identifier, host, kind='alias', www=False):
+        if kind not in ('alias', 'redirect'):
+            raise ValueError('Jenis domain harus Alias atau Redirect.')
         site = self.site(identifier)
-        if host in [site['primary'], *site['secondary']]:
-            raise ValueError('Domain sudah terpasang pada situs ini.')
-        check_dns(host)
+        host = domain(host)
+        hosts = [host]
+        if www and not host.startswith('www.'):
+            hosts.append(domain('www.' + host))
+        for candidate in hosts:
+            self.ensure_free_domain(candidate, allow_site=site['id'])
+            if candidate in site_hosts(site):
+                raise ValueError(f'Domain {candidate} sudah terpasang pada situs ini.')
+            check_dns(candidate)
         old = copy.deepcopy(site)
-        site['secondary'].append(host)
+        role = 'aliases' if kind == 'alias' else 'secondary'
+        site.setdefault(role, []).extend(hosts)
+        new_certificates = [candidate for candidate in hosts
+                            if not self.web.certificate_ready(candidate)]
         try:
             self.web.write_site(site)
-            self.web.obtain_certificate(host, site['email'], site['root'])
-            site['tls'].append(host)
+            for candidate in hosts:
+                self.web.obtain_certificate(candidate, site['email'], site['root'])
+                if candidate not in site['tls']:
+                    site['tls'].append(candidate)
             self.web.write_site(site)
             self.save_site(site)
         except BaseException:
             self.web.write_site(old)
+            self.save_site(old)
+            for candidate in new_certificates:
+                self.delete_certificate(candidate)
             raise
+        return site
+
+    def add_secondary(self, identifier, host):
+        """Compatibility entry point for the former secondary/301 command."""
+        return self.add_domain(identifier, host, kind='redirect')
+
+    def remove_domain(self, identifier, host):
+        site = self.site(identifier)
+        host = domain(host)
+        if host == site['primary']:
+            raise ValueError('Primary tidak dapat dihapus. Set as Primary domain lain terlebih dahulu.')
+        if host not in site_hosts(site):
+            raise ValueError('Domain tidak ditemukan pada situs ini.')
+        self.backup(identifier)
+        old = copy.deepcopy(site)
+        for role in ('aliases', 'secondary'):
+            if host in site.get(role, []):
+                site[role].remove(host)
+        site['tls'] = [h for h in site['tls'] if h != host]
+        try:
+            self.web.write_site(site)
+            self.save_site(site)
+        except BaseException:
+            self.web.write_site(old)
+            self.save_site(old)
+            raise
+        self.delete_certificate(host)
         return site
 
     def remove_secondary(self, identifier, host):
@@ -398,18 +446,13 @@ class Manager:
         host = domain(host)
         if host == site['primary']:
             raise ValueError('Primary tidak dapat dihapus. Ganti primary terlebih dahulu.')
-        if host not in site['secondary']:
+        if host not in site.get('secondary', []):
             raise ValueError('Domain secondary tidak ditemukan.')
-        self.backup(identifier)
-        site['secondary'].remove(host)
-        site['tls'] = [h for h in site['tls'] if h != host]
-        self.web.write_site(site)
-        self.save_site(site)
-        self.delete_certificate(host)
+        return self.remove_domain(identifier, host)
 
     def delete_certificate(self, host):
         # Only single-domain WPI certs are created; remove them after no managed host references remain.
-        if any(host in [s['primary'], *s['secondary']] for s in self.sites()):
+        if any(host in site_hosts(s) for s in self.sites()):
             return
         if host == self.config.get('phpmyadmin', {}).get('domain'):
             return
@@ -427,6 +470,22 @@ class Manager:
                                        ('http:\\/\\/', 'https:\\/\\/'), ('\\/\\/', '\\/\\/')]]
 
     def change_primary(self, identifier, new):
+        """Replace and detach the old primary, retained for existing CLI clients."""
+        return self._change_primary(identifier, new, old_domain='remove')
+
+    def set_primary(self, identifier, new, old_domain='alias'):
+        """Promote an existing Alias and retain the old domain unless requested."""
+        if old_domain not in ('alias', 'redirect', 'remove'):
+            raise ValueError('Peran primary lama harus Alias, Redirect, atau remove.')
+        site = self.site(identifier)
+        new = domain(new)
+        if new == site['primary']:
+            raise ValueError('Domain sudah menjadi primary.')
+        if new not in site.get('aliases', []):
+            raise ValueError('Tambahkan domain sebagai Alias sebelum Set as Primary.')
+        return self._change_primary(identifier, new, old_domain=old_domain)
+
+    def _change_primary(self, identifier, new, old_domain):
         site = self.site(identifier)
         new = self.ensure_free_domain(new, allow_site=site['id'])
         if new == site['primary']:
@@ -437,8 +496,8 @@ class Manager:
         old = site['primary']
         # Provision new ACME hostname before touching content or old primary configuration.
         temporary = copy.deepcopy(site)
-        if new not in temporary['secondary']:
-            temporary['secondary'].append(new)
+        if new not in site_hosts(temporary):
+            temporary.setdefault('aliases', []).append(new)
         try:
             self.web.write_site(temporary)
             self.web.obtain_certificate(new, site['email'], site['root'])
@@ -450,8 +509,14 @@ class Manager:
             self.wp(site, 'option', 'update', 'home', 'https://' + new)
             self.wp(site, 'option', 'update', 'siteurl', 'https://' + new)
             site['primary'] = new
-            site['secondary'] = [h for h in site['secondary'] if h not in (old, new)]
-            site['tls'] = [h for h in site['tls'] if h != old]
+            for role in ('aliases', 'secondary'):
+                if role in site:
+                    site[role] = [h for h in site[role] if h not in (old, new)]
+            if old_domain != 'remove':
+                role = 'aliases' if old_domain == 'alias' else 'secondary'
+                site.setdefault(role, []).append(old)
+            else:
+                site['tls'] = [h for h in site['tls'] if h != old]
             if new not in site['tls']:
                 site['tls'].append(new)
             self.web.write_site(site)
@@ -469,7 +534,8 @@ class Manager:
             raise RuntimeError(f'Pergantian dibatalkan; database dan konfigurasi dikembalikan. Backup: {snapshot}') from error
         finally:
             self.wp(original, 'maintenance-mode', 'deactivate', check=False)
-        self.delete_certificate(old)
+        if old_domain == 'remove':
+            self.delete_certificate(old)
         return site, snapshot
 
     def backup(self, identifier):
@@ -535,7 +601,7 @@ class Manager:
         old = json.loads((folder / 'site.json').read_text())
         if old['root'] != current['root'] or old['id'] != current['id']:
             raise ValueError('Lokasi/identitas backup tidak cocok.')
-        for host in [old['primary'], *old['secondary']]:
+        for host in site_hosts(old):
             self.ensure_free_domain(host, allow_site=current['id'])
         root = Path(current['root'])
         if root != WWW / current['id'] / 'public' or root.is_symlink():
@@ -548,12 +614,12 @@ class Manager:
         # Removed domains lose their old certificates. Restore ACME routes and issue
         # missing certificates before putting the restored HTTPS URLs into service.
         temporary = copy.deepcopy(current)
-        needed = [h for h in [old['primary'], *old['secondary']] if not self.web.certificate_ready(h)]
+        needed = [h for h in site_hosts(old) if not self.web.certificate_ready(h)]
         if needed:
             for host in needed:
                 check_dns(host)
-                if host not in [temporary['primary'], *temporary['secondary']]:
-                    temporary['secondary'].append(host)
+                if host not in site_hosts(temporary):
+                    temporary.setdefault('aliases', []).append(host)
             try:
                 self.web.write_site(temporary)
                 for host in needed:
@@ -576,7 +642,7 @@ class Manager:
             (staged / 'public').rename(root)
             self.runner(['chown', '-R', 'www-data:www-data', str(root)])
             self.restore_database(old, folder)
-            old['tls'] = [h for h in [old['primary'], *old['secondary']] if self.web.certificate_ready(h)]
+            old['tls'] = [h for h in site_hosts(old) if self.web.certificate_ready(h)]
             self.web.write_site(old)
             self.save_site(old)
             self.wp(old, 'cache', 'flush')
@@ -599,7 +665,7 @@ class Manager:
 
     def renew_ssl(self, identifier):
         site = self.site(identifier)
-        for host in [site['primary'], *site['secondary']]:
+        for host in site_hosts(site):
             check_dns(host)
             self.web.obtain_certificate(host, site['email'], site['root'])
             if host not in site['tls']:

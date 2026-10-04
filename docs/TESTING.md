@@ -9,8 +9,17 @@ python3 -m compileall -q wpi
 
 Tes Python memakai direktori sementara dan runner palsu. Tes ini tidak memasang
 paket, mengubah database server, meminta sertifikat, atau menghapus berkas sistem.
-Tujuannya memeriksa batas input, domain yang sudah dipakai, redirect secondary,
+Tujuannya memeriksa batas input, domain yang sudah dipakai, Alias dan Redirect,
 rollback pergantian primary, serta pemisahan penghapusan phpMyAdmin dari database.
+
+Untuk domain v1.3.0, periksa bahwa Add domain memakai Alias secara standar,
+opsi Redirect mempertahankan 301, dan penambahan tanpa www beserta www berlaku
+sebagai satu operasi: kegagalan salah satu hostname mengembalikan metadata,
+konfigurasi web, dan pengelolaan SSL. Set as Primary hanya menerima Alias yang
+sudah terpasang, memperbarui URL database, membuat backup, dan mempertahankan
+primary lama sebagai Alias secara standar. Delete domain harus menolak primary
+serta hanya melepas hostname lain; konten dan database tidak boleh dihapus.
+Metadata secondary lama tetap berarti Redirect 301 sesudah upgrade.
 
 Tes panel memastikan menu dan prompt tidak memegang kunci operasi, sementara
 setiap perubahan memakai satu kunci selama seluruh rangkaian operasi. Pemilihan
@@ -24,6 +33,14 @@ perintah baca `list` dan `status` tetap tersedia. Periksa pelepasan kunci setela
 operasi selesai, gagal, atau proses berakhir. File kunci yang masih ada tanpa
 pemegang aktif tidak boleh menghalangi operasi berikutnya. Tes Linux tersebut
 dilewati pada Windows; tes dispatch/prompt tetap dijalankan di kedua sistem.
+
+Untuk diagnosis v1.3.0, tes Linux memeriksa bahwa `lock-status` menemukan PID
+pemegang kunci yang sebenarnya dari `/proc/locks` dan tetap tersedia ketika
+operasi sedang berjalan. Parser harus mencocokkan device/inode yang tepat serta
+mengabaikan proses yang hanya menunggu kunci. Data `/proc` yang tidak tersedia
+atau berubah saat diperiksa harus menghasilkan status tidak diketahui, tanpa
+menganggap metadata lama sebagai bukti pemegang aktif. Diagnosis tidak boleh
+menghapus file, menghentikan proses, atau membolehkan dua perubahan bersamaan.
 
 Untuk controller PHP/FPM, tes dengan data resource dan status FPM buatan dapat
 memeriksa keputusan tanpa membebani VPS. Cakupan yang diperlukan: pembatasan
@@ -54,8 +71,12 @@ sudo env CI=true WPI_DISPOSABLE_VM=1 bash tests/integration.sh apache
 ```
 
 Tes integrasi menguji server web, PHP-FPM, database, dan WordPress yang benar-benar
-berjalan, lalu memeriksa perubahan URL termasuk data option terserialisasi,
-redirect secondary 301, dan akses database sesudah UI phpMyAdmin dihapus.
+berjalan. Alias harus membuka halaman serta permalink WordPress dengan HTTP
+200 pada hostname Alias. Periksa perubahan URL termasuk option terserialisasi
+setelah Set as Primary, akses domain lama sebagai Alias, Redirect 301 dengan
+path/query yang sama, serta keberadaan database sesudah Delete domain dan
+penghapusan UI phpMyAdmin. Penambahan pasangan www juga harus diperiksa pada
+kedua hostname.
 Bootstrap memasang bundle ZIP yang dibangun dari source dan menjalankan launcher
 terpasang. Setelah seluruh alur, pemasangan ulang aplikasi wajib mempertahankan
 seluruh metadata situs dan kredensial yang sama.
@@ -95,9 +116,13 @@ perubahan domain.
 | --- | --- |
 | Instalasi Nginx dan Apache | Halaman WordPress dapat dibuka melalui HTTPS; login administrator berhasil; `nginx -t` atau `apachectl configtest` berhasil. |
 | SSL otomatis | Sertifikat valid untuk hostname, rantai dipercaya browser, HTTP redirect ke HTTPS, timer pembaruan Certbot aktif. |
-| Secondary | `/artikel?x=1` menghasilkan 301 ke primary dengan path dan query yang sama, melalui HTTP maupun HTTPS. |
-| Ganti primary | `home`, `siteurl`, permalink, media, post, dan option terserialisasi memakai primary baru; hostname lama tidak lagi terdaftar. |
-| Rollback | Ganggu reload server web saat uji ganti primary; setelah kegagalan, domain, konfigurasi, dan data WordPress lama tetap dapat dipakai. |
+| Add domain — Alias | Homepage dan permalink menghasilkan HTTP 200 pada hostname Alias, tanpa pengalihan ke primary. Tautan WordPress yang dihasilkan memakai hostname Alias; tautan tersimpan dalam konten tetap diperiksa terpisah. |
+| Add domain — Redirect | `/artikel?x=1` menghasilkan 301 ke primary dengan path dan query yang sama, melalui HTTP maupun HTTPS. |
+| Pasangan www | Hostname tanpa www dan www terpasang sesuai peran yang dipilih; kegagalan salah satu hostname membatalkan penambahan pasangan tanpa mengubah domain lama. |
+| Set as Primary | Alias yang dipilih menjadi satu-satunya primary; `home`, `siteurl`, permalink, media, post, dan option terserialisasi memakai primary baru. Backup dibuat dan primary lama tetap membuka situs sebagai Alias. Opsi Redirect/remove pada perintah langsung harus mengikuti pilihan tersebut. |
+| Delete domain | Alias atau Redirect yang dipilih dilepas dari vhost/SSL; file, seluruh tabel/database, dan hostname lain tetap tersedia. Primary ditolak sampai Alias lain dijadikan primary. |
+| Upgrade domain lama | Metadata secondary yang sudah terpasang tetap menghasilkan Redirect 301; tidak ada perubahan peran otomatis menjadi Alias. |
+| Rollback | Ganggu reload server web saat uji Set as Primary; setelah kegagalan, domain, konfigurasi, dan data WordPress lama tetap dapat dipakai. |
 | phpMyAdmin | UI HTTPS menuntut Basic Auth sebelum halaman login database; kredensial panel tidak tampil pada daftar proses. |
 | Hapus phpMyAdmin | Hostname/UI tidak dapat dibuka; WordPress dan seluruh tabel/database masih tersedia. |
 | Backup/restore | Cadangkan, ubah sebuah post uji, restore, lalu periksa isi dan URL situs kembali benar. |

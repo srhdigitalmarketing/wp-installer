@@ -1,4 +1,27 @@
-# Storyboard video demo WPI 1.0.0
+# Storyboard WPI: menu terbaru dan arsip video 1.0.0
+
+Video publik yang sudah diunggah adalah rekaman **v1.0.0**, dengan alur domain
+lama: secondary selalu Redirect 301 dan pergantian primary melepas domain lama.
+Video tersebut belum memperlihatkan Alias atau Set as Primary pada v1.3.0 dan
+tidak diregenerasi dalam rilis ini. Transkrip historis di bawah dipertahankan
+untuk menjelaskan rekaman yang tersedia.
+
+## Diagram menu v1.3.0
+
+Diagram berikut menunjukkan menu terbaru; ini bukan transkrip video lama:
+
+```text
+(3) Add domain        -> Alias (standar) atau Redirect 301; www opsional
+(4) Set as Primary    -> Pilih Alias; backup dan replace URL; primary lama Alias
+(5) Delete domain     -> Lepas hostname Alias/Redirect; situs dan database tetap
+```
+
+Satu situs mempunyai satu Primary. Untuk menjadikan domain baru sebagai primary,
+tambahkan sebagai Alias melalui menu 3, lalu pilih domain tersebut pada menu 4.
+Menu 5 menolak penghapusan primary sampai Alias lain dijadikan primary. Semua
+hostname baru tetap memerlukan DNS ke VPS agar SSL dapat dikonfigurasi otomatis.
+
+## Arsip rekaman v1.0.0
 
 Durasi ekspor: 142 detik, 8 adegan. Bahasa: Indonesia. Rekam menu dan prompt asli
 `wpi/cli.py` dengan backend simulasi. Domain contoh tidak dipasang pada VPS.
@@ -65,9 +88,10 @@ Jika perintah tidak benar-benar dijalankan pada Ubuntu, tampilkan sebagai
 Kalimat sukses bootstrap yang memang terdapat dalam `install.sh`:
 `WPI 1.0.0 berhasil dipasang. Jalankan: sudo wpi`.
 
-### Adegan 3 — menu asli
+### Adegan 3 — menu asli pada rekaman v1.0.0
 
-Tampilkan menu dari fungsi `menu()` di `wpi/cli.py`, sebelum stack dikonfigurasi:
+Cuplikan berikut adalah menu historis sebelum stack dikonfigurasi; menu terbaru
+untuk nomor 3, 4, dan 5 ditunjukkan pada diagram v1.3.0 di atas:
 
 ```text
 WPI — WordPress Installer  v1.0.0
@@ -216,6 +240,6 @@ Rilis: v1.0.0
 DEMO SIMULASI — pemasangan server & SSL tidak dijalankan dalam video
 ```
 
-Sumber storyboard: `README.md`, `wpi/cli.py`, `wpi/core.py`, dan `install.sh`
-di checkout lokal. Semua angka menu, prompt, dan pesan sukses mengikuti sumber
-tersebut. Overlay penjelasan dibedakan dari keluaran terminal asli.
+Sumber transkrip historis: `README.md`, `wpi/cli.py`, `wpi/core.py`, dan
+`install.sh` pada rilis v1.0.0. Diagram terbaru mengikuti menu v1.3.0. Overlay
+penjelasan dibedakan dari keluaran terminal asli.

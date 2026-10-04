@@ -110,11 +110,54 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result, 0)
         manager.change_primary.assert_called_once_with("old.example.com", "new.example.com")
 
-    def test_secondary_add_does_not_change_primary(self):
+    def test_add_domain_defaults_to_alias_without_www(self):
         manager = mock.Mock()
         result = self.run_main(["add-domain", "example.com", "alias.example.com"], manager)
         self.assertEqual(result, 0)
-        self.assertEqual(manager.mock_calls, [mock.call.add_secondary("example.com", "alias.example.com")])
+        self.assertEqual(manager.mock_calls, [mock.call.add_domain(
+            "example.com", "alias.example.com", kind="alias", www=False)])
+
+    def test_add_domain_can_select_redirect_and_include_www(self):
+        manager = mock.Mock()
+        result = self.run_main(["add-domain", "example.com", "alias.example.com",
+                                "--type", "redirect", "--www"], manager)
+        self.assertEqual(result, 0)
+        manager.add_domain.assert_called_once_with(
+            "example.com", "alias.example.com", kind="redirect", www=True)
+
+    def test_invalid_scripted_domain_type_is_rejected_before_manager_creation(self):
+        with mock.patch.object(cli, 'Manager') as manager, contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as result:
+                cli.main(['add-domain', 'example.com', 'alias.example.com', '--type', 'primary'])
+        self.assertEqual(result.exception.code, 2)
+        manager.assert_not_called()
+
+    def test_set_primary_defaults_to_retaining_old_primary_as_alias(self):
+        manager = mock.Mock()
+        manager.set_primary.return_value = ({'primary': 'alias.example.com'}, Path('/backup'))
+        result = self.run_main(['set-primary', 'example.com', 'alias.example.com'],
+                               manager, 'alias.example.com')
+        self.assertEqual(result, 0)
+        manager.set_primary.assert_called_once_with(
+            'example.com', 'alias.example.com', old_domain='alias')
+
+    def test_set_primary_explicit_old_domain_policy_is_dispatched(self):
+        for policy in ('redirect', 'remove'):
+            with self.subTest(policy=policy):
+                manager = mock.Mock()
+                manager.set_primary.return_value = ({'primary': 'alias.example.com'}, Path('/backup'))
+                result = self.run_main(['set-primary', 'example.com', 'alias.example.com',
+                                        '--old-domain', policy], manager, 'alias.example.com')
+                self.assertEqual(result, 0)
+                manager.set_primary.assert_called_once_with(
+                    'example.com', 'alias.example.com', old_domain=policy)
+
+    def test_delete_domain_dispatches_alias_or_redirect_removal(self):
+        manager = mock.Mock()
+        result = self.run_main(['delete-domain', 'example.com', 'alias.example.com'],
+                               manager, 'alias.example.com')
+        self.assertEqual(result, 0)
+        self.assertEqual(manager.mock_calls, [mock.call.remove_domain('example.com', 'alias.example.com')])
 
     def test_existing_stack_does_not_reprompt_setup(self):
         manager = mock.Mock(config={"stack": "apache", "database": "mysql"})
@@ -151,7 +194,7 @@ class CliTests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()) as output:
             cli.menu(manager)
         text = output.getvalue()
-        for label in ["Install WordPress", "(3) Add domain", "Change domain primary",
+        for label in ["Install WordPress", "(3) Add domain", "(4) Set as Primary", "(5) Delete domain",
                       "Install phpMyAdmin", "Delete panel phpMyAdmin", "Backup", "Restore", "Keluar"]:
             self.assertIn(label, text)
         manager.setup.assert_not_called()
@@ -273,7 +316,7 @@ class CliTests(unittest.TestCase):
     def test_menu_mutation_releases_lock_before_returning_to_menu(self):
         manager = mock.Mock(config={})
         site = {'id': 'abcdef123456', 'primary': 'old.example.com',
-                'secondary': [], 'status': 'active'}
+                'aliases': [], 'secondary': [], 'status': 'active'}
         manager.sites.return_value = [site]
         manager.site.return_value = site
         locked = False
@@ -290,33 +333,153 @@ class CliTests(unittest.TestCase):
             finally:
                 locked = False
 
-        def add(identifier, domain):
+        def add(identifier, domain, kind, www):
             self.assertTrue(locked)
             self.assertEqual((identifier, domain), ('abcdef123456', 'alias.example.com'))
+            self.assertEqual((kind, www), ('alias', False))
             return site
 
-        replies = iter(['3', '', 'alias.example.com', '', '2', '', '0'])
+        replies = iter(['3', '', 'alias.example.com', '', '', '', '2', '', '0'])
 
         def answer(prompt):
             self.assertFalse(locked, 'Menu input and confirmation must not own the mutation lock.')
             return next(replies)
 
-        manager.add_secondary.side_effect = add
+        manager.add_domain.side_effect = add
         with mock.patch.object(cli, 'operation_lock', side_effect=operation), \
              mock.patch('builtins.input', side_effect=answer), \
              contextlib.redirect_stdout(io.StringIO()):
             cli.menu(manager)
         self.assertEqual(len(acquired), 1)
         self.assertFalse(locked)
-        manager.add_secondary.assert_called_once()
+        manager.add_domain.assert_called_once_with(
+            'abcdef123456', 'alias.example.com', kind='alias', www=False)
+
+    def test_menu_add_domain_can_choose_redirect_with_www(self):
+        manager = mock.Mock(config={})
+        site = {'id': 'abcdef123456', 'primary': 'old.example.com',
+                'aliases': [], 'secondary': [], 'status': 'active'}
+        manager.sites.return_value = [site]
+        manager.site.return_value = site
+        manager.add_domain.return_value = site
+        with mock.patch.object(cli, 'operation_lock', return_value=contextlib.nullcontext()), \
+             mock.patch('builtins.input', side_effect=[
+                 '3', '', 'alias.example.com', '2', '1', '', '0',
+             ]), contextlib.redirect_stdout(io.StringIO()):
+            cli.menu(manager)
+        manager.add_domain.assert_called_once_with(
+            'abcdef123456', 'alias.example.com', kind='redirect', www=True)
+
+    def test_invalid_menu_domain_type_or_www_choice_has_no_mutation(self):
+        for kind, www in (('9', '2'), ('1', '9')):
+            with self.subTest(kind=kind, www=www):
+                manager = mock.Mock(config={})
+                site = {'id': 'abcdef123456', 'primary': 'old.example.com',
+                        'aliases': [], 'secondary': [], 'status': 'active'}
+                manager.sites.return_value = [site]
+                manager.site.return_value = site
+                selections = iter(['3', '0'])
+
+                def answer(prompt):
+                    if 'Masukkan nomor' in prompt:
+                        return next(selections)
+                    if 'ID/domain' in prompt:
+                        return ''
+                    if 'Domain baru' in prompt:
+                        return 'alias.example.com'
+                    if 'www' in prompt:
+                        return www
+                    if 'Alias' in prompt:
+                        return kind
+                    if 'Enter' in prompt:
+                        return ''
+                    self.fail('Unexpected prompt: ' + prompt)
+
+                with mock.patch.object(cli, 'operation_lock') as lock, \
+                     mock.patch('builtins.input', side_effect=answer), \
+                     contextlib.redirect_stdout(io.StringIO()) as output:
+                    cli.menu(manager)
+                self.assertIn('Gagal:', output.getvalue())
+                lock.assert_not_called()
+                manager.add_domain.assert_not_called()
+
+    def test_menu_set_as_primary_uses_existing_alias_and_default_old_domain_retention(self):
+        manager = mock.Mock(config={})
+        site = {'id': 'abcdef123456', 'primary': 'old.example.com',
+                'aliases': ['alias.example.com'], 'secondary': [], 'status': 'active'}
+        manager.sites.return_value = [site]
+        manager.site.return_value = site
+        locked = False
+        acquisitions = []
+
+        @contextlib.contextmanager
+        def operation():
+            nonlocal locked
+            self.assertFalse(locked)
+            acquisitions.append(True)
+            locked = True
+            try:
+                yield
+            finally:
+                locked = False
+
+        replies = iter(['4', '', 'alias.example.com', 'alias.example.com', '', '0'])
+
+        def answer(prompt):
+            self.assertFalse(locked, 'Primary selection and confirmation must finish before locking.')
+            return next(replies)
+
+        def promote(identifier, host):
+            self.assertTrue(locked, 'Primary promotion must be serialized with other mutations.')
+            return {**site, 'primary': host}, Path('/backup')
+
+        manager.set_primary.side_effect = promote
+        with mock.patch.object(cli, 'operation_lock', side_effect=operation), \
+             mock.patch('builtins.input', side_effect=answer), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            cli.menu(manager)
+        manager.set_primary.assert_called_once_with('abcdef123456', 'alias.example.com')
+        self.assertEqual(len(acquisitions), 1)
+        self.assertFalse(locked)
+        self.assertIn('alias.example.com', output.getvalue())
+        manager.change_primary.assert_not_called()
+
+    def test_menu_set_as_primary_requires_an_alias_before_prompts_or_mutation(self):
+        manager = mock.Mock(config={})
+        site = {'id': 'abcdef123456', 'primary': 'old.example.com',
+                'aliases': [], 'secondary': ['redirect.example.com'], 'status': 'active'}
+        manager.sites.return_value = [site]
+        manager.site.return_value = site
+        with mock.patch.object(cli, 'operation_lock') as lock, \
+             mock.patch('builtins.input', side_effect=['4', '', '', '0']), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            cli.menu(manager)
+        self.assertIn('Tambahkan domain sebagai Alias', output.getvalue())
+        lock.assert_not_called()
+        manager.set_primary.assert_not_called()
+
+    def test_menu_delete_domain_dispatches_general_domain_removal(self):
+        manager = mock.Mock(config={})
+        site = {'id': 'abcdef123456', 'primary': 'old.example.com',
+                'aliases': ['alias.example.com'], 'secondary': [], 'status': 'active'}
+        manager.sites.return_value = [site]
+        manager.site.return_value = site
+        with mock.patch.object(cli, 'operation_lock', return_value=contextlib.nullcontext()) as lock, \
+             mock.patch('builtins.input', side_effect=[
+                 '5', '', 'alias.example.com', 'alias.example.com', '', '0',
+             ]), contextlib.redirect_stdout(io.StringIO()):
+            cli.menu(manager)
+        manager.remove_domain.assert_called_once_with('abcdef123456', 'alias.example.com')
+        lock.assert_called_once_with()
+        manager.remove_secondary.assert_not_called()
 
     def test_menu_busy_operation_can_be_retried_without_reopening_panel(self):
         manager = mock.Mock(config={})
         site = {'id': 'abcdef123456', 'primary': 'old.example.com',
-                'secondary': [], 'status': 'active'}
+                'aliases': [], 'secondary': [], 'status': 'active'}
         manager.sites.return_value = [site]
         manager.site.return_value = site
-        manager.add_secondary.return_value = site
+        manager.add_domain.return_value = site
         acquisitions = 0
 
         @contextlib.contextmanager
@@ -329,13 +492,14 @@ class CliTests(unittest.TestCase):
 
         with mock.patch.object(cli, 'operation_lock', side_effect=operation), \
              mock.patch('builtins.input', side_effect=[
-                 '3', '', 'alias.example.com', '', '2', '',
-                 '3', '', 'alias.example.com', '', '0',
+                 '3', '', 'alias.example.com', '', '', '', '2', '',
+                 '3', '', 'alias.example.com', '', '', '', '0',
              ]), contextlib.redirect_stdout(io.StringIO()) as output:
             cli.menu(manager)
         self.assertIn('Operasi WPI lain sedang berjalan', output.getvalue())
         self.assertEqual(acquisitions, 2)
-        manager.add_secondary.assert_called_once_with('abcdef123456', 'alias.example.com')
+        manager.add_domain.assert_called_once_with(
+            'abcdef123456', 'alias.example.com', kind='alias', www=False)
         self.assertGreaterEqual(manager.sites.call_count, 3)
 
     def test_busy_scripted_mutation_returns_error_without_mutating(self):
@@ -347,7 +511,7 @@ class CliTests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()), \
              contextlib.redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(cli.main(['add-domain', 'old.example.com', 'alias.example.com']), 1)
-        manager.add_secondary.assert_not_called()
+        manager.add_domain.assert_not_called()
         self.assertIn('operation occupied', errors.getvalue())
 
     def test_domain_uniqueness_is_rechecked_from_disk_after_lock_acquisition(self):
@@ -371,7 +535,7 @@ class CliTests(unittest.TestCase):
 
             with mock.patch.object(cli, 'operation_lock', side_effect=operation), \
                  mock.patch.object(core, 'check_dns', side_effect=AssertionError('Conflict must be rejected before DNS.')), \
-                 mock.patch('builtins.input', side_effect=['3', '', 'alias.example.com', '', '0']), \
+                 mock.patch('builtins.input', side_effect=['3', '', 'alias.example.com', '', '', '', '0']), \
                  contextlib.redirect_stdout(io.StringIO()) as output:
                 cli.menu(manager)
             self.assertIn('sudah dipakai situs lain', output.getvalue())

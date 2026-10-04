@@ -1,14 +1,16 @@
 """Render, activation rollback and no-database-removal contract tests."""
 
 import copy
+import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from wpi.web import HEADER, WebStack
+from wpi.web import ALIAS_PLUGIN_HEADER, ALIAS_PLUGIN_NAME, HEADER, WebStack
 
 
 SITE = {"id": "example-abc123", "primary": "example.com",
@@ -72,6 +74,57 @@ class WebRenderTests(unittest.TestCase):
         site = {**SITE, "tls": ["outside.example.com"]}
         with self.assertRaises(ValueError):
             self.stack().render_site(site)
+
+    def test_alias_serves_wordpress_without_primary_redirect(self):
+        site = {**SITE, "aliases": ["alias.example.com"]}
+        for name in ("nginx", "apache"):
+            with self.subTest(stack=name):
+                result = self.stack(name).render_site(site)
+                marker = "server_name alias.example.com;" if name == "nginx" else "ServerName alias.example.com"
+                section = result.split(marker, 1)[1].split("server {" if name == "nginx" else "<VirtualHost", 1)[0]
+                self.assertIn("try_files $uri $uri/ /index.php?$args" if name == "nginx"
+                              else "RewriteRule . /index.php [END]", section)
+                self.assertIn(SITE["root"], section)
+                self.assertNotIn("301", section)
+                self.assertNotIn("http://example.com", section)
+
+    def test_alias_https_upgrade_keeps_own_host_and_certificate(self):
+        site = {**SITE, "aliases": ["alias.example.com"],
+                "tls": ["example.com", "alias.example.com"]}
+        for name in ("nginx", "apache"):
+            with self.subTest(stack=name):
+                result = self.stack(name).render_site(site)
+                self.assertIn("https://alias.example.com", result)
+                self.assertIn("/etc/letsencrypt/live/alias.example.com/fullchain.pem", result)
+                self.assertEqual(result.count("listen 443 ssl;" if name == "nginx" else "<VirtualHost *:443>"), 2)
+                expected = ("return 301 https://alias.example.com$request_uri;" if name == "nginx"
+                            else "RewriteRule ^ https://alias.example.com%{REQUEST_URI} [R=301,L,NE]")
+                self.assertIn(expected, result)
+
+    def test_duplicate_domain_across_any_role_is_rejected(self):
+        for aliases, redirects in ((["example.com"], []), (["same.example.com"], ["same.example.com"]),
+                                   (["same.example.com", "same.example.com"], [])):
+            with self.subTest(aliases=aliases, redirects=redirects), self.assertRaises(ValueError):
+                self.stack().render_site({**SITE, "aliases": aliases, "secondary": redirects})
+
+    def test_invalid_alias_collection_or_tls_duplicate_is_rejected(self):
+        for update in ({"aliases": "alias.example.com"}, {"aliases": ["BAD.example.com"]},
+                       {"tls": ["example.com", "example.com"]}):
+            with self.subTest(update=update), self.assertRaises(ValueError):
+                self.stack().render_site({**SITE, **update})
+
+    def test_alias_plugin_contains_only_aliases_with_correct_scheme(self):
+        site = {**SITE, "aliases": ["alias.example.com", "plain.example.com"],
+                "tls": ["alias.example.com"]}
+        original = copy.deepcopy(site)
+        plugin = self.stack().render_alias_plugin(site)
+        self.assertTrue(plugin.startswith(ALIAS_PLUGIN_HEADER))
+        self.assertIn("'alias.example.com' => 'https://alias.example.com'", plugin)
+        self.assertIn("'plain.example.com' => 'http://plain.example.com'", plugin)
+        self.assertNotIn("secondary.example.com", plugin)
+        self.assertNotIn("'example.com'", plugin)
+        self.assertNotIn("update_option", plugin)
+        self.assertEqual(site, original)
 
     def test_domain_and_path_injection_are_rejected(self):
         bad_sites = [
@@ -173,6 +226,77 @@ class WebActivationTests(unittest.TestCase):
         self.assertEqual([call.args[0] for call in self.runner.call_args_list],
                          [["nginx", "-t"], ["systemctl", "reload", "nginx"]])
 
+    def local_plugin(self):
+        content = self.base / "wordpress" / "wp-content"
+        content.mkdir(parents=True, exist_ok=True)
+        return content / "mu-plugins" / ALIAS_PLUGIN_NAME
+
+    def test_alias_plugin_is_managed_and_removed_with_last_alias(self):
+        plugin = self.local_plugin()
+        alias_site = {**SITE, "aliases": ["alias.example.com"]}
+        with patch.object(self.web, "_alias_plugin_path", return_value=plugin):
+            self.web.write_site(alias_site)
+            self.assertEqual(plugin.read_text(), self.web.render_alias_plugin(alias_site))
+            self.assertTrue(plugin.read_text().startswith(ALIAS_PLUGIN_HEADER))
+            self.assertEqual(plugin.stat().st_mode & 0o777, 0o644 if os.name == "posix" else 0o666)
+            self.web.write_site(SITE)
+            self.assertFalse(plugin.exists())
+
+    def test_failed_alias_update_restores_both_vhost_and_plugin(self):
+        plugin = self.local_plugin()
+        with patch.object(self.web, "_alias_plugin_path", return_value=plugin):
+            self.web.write_site({**SITE, "aliases": ["first.example.com"]})
+            previous_plugin = plugin.read_bytes()
+            target = self.web.available / f"wpi-{SITE['id']}.conf"
+            previous_vhost = target.read_bytes()
+            self.runner.side_effect = [subprocess.CalledProcessError(1, ["nginx", "-t"]),
+                                       subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 0)]
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.web.write_site({**SITE, "aliases": ["second.example.com"]})
+            self.assertEqual(plugin.read_bytes(), previous_plugin)
+            self.assertEqual(target.read_bytes(), previous_vhost)
+
+    def test_failed_alias_first_write_restores_plugin_absence(self):
+        plugin = self.local_plugin()
+        with patch.object(self.web, "_alias_plugin_path", return_value=plugin):
+            self.runner.side_effect = subprocess.CalledProcessError(1, ["nginx", "-t"])
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.web.write_site({**SITE, "aliases": ["alias.example.com"]})
+        self.assertFalse(plugin.exists())
+
+    def test_failed_alias_removal_restores_managed_plugin(self):
+        plugin = self.local_plugin()
+        with patch.object(self.web, "_alias_plugin_path", return_value=plugin):
+            self.web.write_site({**SITE, "aliases": ["alias.example.com"]})
+            before = plugin.read_bytes()
+            self.runner.side_effect = subprocess.CalledProcessError(1, ["nginx", "-t"])
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.web.write_site(SITE)
+        self.assertEqual(plugin.read_bytes(), before)
+
+    def test_alias_does_not_replace_unmanaged_plugin(self):
+        plugin = self.local_plugin()
+        plugin.parent.mkdir()
+        plugin.write_text("<?php // another application\n")
+        before = plugin.read_bytes()
+        with patch.object(self.web, "_alias_plugin_path", return_value=plugin), self.assertRaises(RuntimeError):
+            self.web.write_site({**SITE, "aliases": ["alias.example.com"]})
+        self.assertEqual(plugin.read_bytes(), before)
+        self.runner.assert_not_called()
+
+    def test_alias_requires_existing_wordpress_content(self):
+        plugin = self.base / "absent" / "wp-content" / "mu-plugins" / ALIAS_PLUGIN_NAME
+        with patch.object(self.web, "_alias_plugin_path", return_value=plugin), self.assertRaises(RuntimeError):
+            self.web.write_site({**SITE, "aliases": ["alias.example.com"]})
+        self.assertFalse(plugin.parent.parent.exists())
+        self.runner.assert_not_called()
+
+    def test_alias_plugin_rejects_unmanaged_root_or_symlink_path(self):
+        with self.assertRaises(ValueError):
+            self.web._alias_plugin_path({**SITE, "root": "/var/www/wpi/another/public"})
+        with patch.object(Path, "is_symlink", return_value=True), self.assertRaises(RuntimeError):
+            self.web._alias_plugin_path(SITE)
+
     def test_failed_syntax_check_rolls_back_existing_file(self):
         self.web.write_site(SITE)
         target = self.web.available / f"wpi-{SITE['id']}.conf"
@@ -265,6 +389,49 @@ class WebActivationTests(unittest.TestCase):
         self.assertIn("listen 80 default_server", config.read_text())
         self.assertIn("return 444", config.read_text())
         self.assertNotIn("root ", config.read_text())
+
+
+class AliasPluginPhpTests(unittest.TestCase):
+    """Execute generated PHP when a runtime is present; real WP is in CI integration."""
+
+    def test_alias_filters_use_allowlisted_host_and_skip_cli(self):
+        php = shutil.which("php")
+        local_php = Path("C:/laragon/bin/php/php-8.3.33-Win32-vs16-x64/php.exe")
+        if php is None and local_php.is_file():
+            php = str(local_php)
+        if php is None:
+            self.skipTest("PHP runtime absent; WordPress filter behavior is exercised in Ubuntu integration")
+        web = WebStack(Mock(), "nginx", "8.3")
+        site = {**SITE, "aliases": ["alias.example.com", "plain.example.com"], "tls": ["alias.example.com"]}
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = Path(directory) / ALIAS_PLUGIN_NAME
+            plugin.write_text(web.render_alias_plugin(site), encoding="utf-8")
+            harness = Path(directory) / "harness.php"
+            harness.write_text("<?php\n"
+                               "define('ABSPATH', '/');\n"
+                               "if ($argv[3] === 'cli') { define('WP_CLI', true); }\n"
+                               "$_SERVER['HTTP_HOST'] = $argv[2];\n"
+                               "$filters = array();\n"
+                               "function add_filter($name, $callback, $priority) { global $filters; $filters[$name] = $callback; }\n"
+                               "include $argv[1];\n"
+                               "$home = isset($filters['option_home']) ? $filters['option_home']('https://example.com/blog') : 'https://example.com/blog';\n"
+                               "$siteurl = isset($filters['option_siteurl']) ? $filters['option_siteurl']('https://example.com/wp') : 'https://example.com/wp';\n"
+                               "echo json_encode(array($home, $siteurl));\n", encoding="utf-8")
+            cases = (("alias.example.com", "web", "https://alias.example.com"),
+                     ("ALIAS.EXAMPLE.COM:443", "web", "https://alias.example.com"),
+                     ("plain.example.com", "web", "http://plain.example.com"),
+                     ("alias.example.com", "cli", "https://example.com"),
+                     ("secondary.example.com", "web", "https://example.com"),
+                     ("example.com", "web", "https://example.com"),
+                     ("alias.example.com.evil.test", "web", "https://example.com"),
+                     ("alias.example.com:666", "web", "https://example.com"),
+                     ("alias.example.com\n", "web", "https://example.com"),
+                     ("", "web", "https://example.com"))
+            for host, mode, expected in cases:
+                with self.subTest(host=host, mode=mode):
+                    result = subprocess.run([php, "-n", str(harness), str(plugin), host, mode],
+                                            check=True, capture_output=True, text=True)
+                    self.assertEqual(json.loads(result.stdout), [expected + "/blog", expected + "/wp"])
 
 
 if __name__ == "__main__":

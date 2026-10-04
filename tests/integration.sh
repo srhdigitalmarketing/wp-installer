@@ -156,7 +156,9 @@ def verify_redirect(host, target, https):
     raise AssertionError((host, status, headers))
 
 def expected_request(host, status, **kwargs):
-    for _ in range(10):
+    # Allow normal vhost readiness and FPM OPcache timestamp revalidation after
+    # an atomic change to the managed Alias plugin (default interval: 2 sec).
+    for _ in range(25):
         response = request(host, **kwargs)
         if response[0] == status and response[3] == 0:
             return response
@@ -282,7 +284,7 @@ def reinstall_with_idle_panel():
             chunk = os.read(panel.stdout.fileno(), 65536)
             assert chunk, 'Panel exited before displaying its menu.'
             output += chunk
-        for command in ('status', 'list'):
+        for command in ('status', 'list', 'lock-status'):
             subprocess.run(['/usr/local/bin/wpi', command], check=True,
                            text=True, capture_output=True, timeout=20)
         subprocess.run(['bash', 'install.sh', '--bundle', os.environ['WPI_CI_BUNDLE'],
@@ -297,6 +299,61 @@ def reinstall_with_idle_panel():
     assert panel.returncode == 0, 'Idle panel did not close normally.'
     print('Real installed idle panel allowed status, list, and bootstrap upgrade; '
           'panel closed normally with option 0.', flush=True)
+
+
+def verify_runcloud_domains(site, post):
+    """Real WordPress Alias access, promotion and domain-only deletion."""
+    primary = site['primary']
+    live_alias = 'wpi-live.example.com'
+    paired_alias = 'wpi-pair.example.com'
+    paired_redirect = 'wpi-forward.example.com'
+    slug = manager.wp(site, 'post', 'get', post, '--field=post_name').stdout.strip()
+    path = '/' + slug + '/'
+    manager.add_domain(site['id'], live_alias, kind='alias')
+    manager.add_domain(site['id'], paired_alias, kind='alias', www=True)
+    for host in (live_alias, paired_alias, 'www.' + paired_alias):
+        status, headers, body, code = expected_request(host, 200, path=path)
+        assert status == 200 and code == 0 and 'Domain regression' in body, (host, status)
+        assert f'https://{host}{path}' in body, 'Alias canonical URL did not keep its hostname.'
+        assert not re.search(r'^location:', headers, re.I | re.M), headers
+        verify_redirect(host, host, https=False)
+    # Must-use URL filters never alter the persistent primary or WP-CLI work.
+    assert manager.wp(site, 'option', 'get', 'home').stdout.strip() == 'https://' + primary
+    manager.add_domain(site['id'], paired_redirect, kind='redirect', www=True)
+    for host in (paired_redirect, 'www.' + paired_redirect):
+        verify_redirect(host, primary, https=True)
+    tables_before = manager.wp(site, 'db', 'tables', '--all-tables-with-prefix').stdout
+    promoted, _ = manager.set_primary(site['id'], live_alias)
+    assert promoted['primary'] == live_alias and primary in promoted['aliases']
+    assert live_alias not in promoted['aliases']
+    for option in ('home', 'siteurl'):
+        assert manager.wp(promoted, 'option', 'get', option).stdout.strip() == 'https://' + live_alias
+    assert f'https://{live_alias}/inside' in manager.wp(promoted, 'post', 'get', post, '--field=post_content').stdout
+    assert expected_request(primary, 200, path=path)[0] == 200, 'Former primary Alias became a redirect.'
+    for host in (paired_redirect, 'www.' + paired_redirect):
+        verify_redirect(host, live_alias, https=True)
+    try:
+        manager.remove_domain(site['id'], live_alias)
+        raise AssertionError('Deleting the active primary was allowed.')
+    except ValueError:
+        pass
+    manager.remove_domain(site['id'], primary)
+    time.sleep(0.2)
+    verify_denied(primary, https=False)
+    verify_denied(primary, https=True)
+    assert manager.wp(promoted, 'db', 'tables', '--all-tables-with-prefix').stdout == tables_before
+    manager.wp(promoted, 'core', 'is-installed')
+    assert expected_request(live_alias, 200, path=path)[0] == 200
+    # Return to the existing fixture's primary through the same public flow.
+    manager.add_domain(site['id'], primary, kind='alias')
+    restored, _ = manager.set_primary(site['id'], primary)
+    for host in (live_alias, paired_alias, 'www.' + paired_alias, paired_redirect, 'www.' + paired_redirect):
+        manager.remove_domain(site['id'], host)
+    assert expected_request(primary, 200, path=path)[0] == 200
+    print('RunCloud-style domains passed: Alias permalink HTTP 200, www pair, Redirect 301, '
+          'existing Alias promoted with WordPress URL replacement, old domain deleted, '
+          'primary deletion refused, and database preserved.', flush=True)
+    return manager.site(restored['id'])
 
 
 with mock.patch.object(core, 'check_dns', return_value=None), \
@@ -357,6 +414,7 @@ with mock.patch.object(core, 'check_dns', return_value=None), \
     assert restored['primary'] == old
     assert manager.wp(restored, 'option', 'get', 'siteurl').stdout.strip() == 'https://' + old
     assert expected_request(old, 200)[0] == 200
+    restored = verify_runcloud_domains(restored, post)
 
     tables_before = manager.wp(restored, 'db', 'tables', '--all-tables-with-prefix').stdout
     manager.install_pma(pma, 'owner@example.com', password='CiPanelPassword123!')

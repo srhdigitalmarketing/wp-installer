@@ -1,6 +1,8 @@
 """Real advisory-lock contention checks on Linux, with no server changes."""
 
 from pathlib import Path
+import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -29,7 +31,7 @@ cli.DATA = Path(sys.argv[1])
 manager = mock.Mock(config={})
 manager.sites.return_value = []
 manager.doctor.return_value = []
-manager.add_secondary.side_effect = lambda *args: print('MUTATION_EXECUTED')
+manager.add_domain.side_effect = lambda *args, **kwargs: print('MUTATION_EXECUTED')
 with mock.patch.object(cli, 'Manager', return_value=manager), \
      mock.patch.object(cli.os, 'geteuid', return_value=0), \
      mock.patch('builtins.input', return_value='0'):
@@ -47,6 +49,8 @@ sys.exit(result)
                 busy = self.run_child(['add-domain', 'old.example.com', 'alias.example.com'])
                 self.assertEqual(busy.returncode, 1, busy.stdout + busy.stderr)
                 self.assertIn('Operasi WPI lain sedang berjalan', busy.stderr)
+                self.assertIn(str(os.getpid()), busy.stderr)
+                self.assertIn('lslocks', busy.stderr)
                 self.assertNotIn('MUTATION_EXECUTED', busy.stdout)
                 self.assertEqual(path.stat().st_ino, original_inode)
             available = self.run_child(['add-domain', 'old.example.com', 'alias.example.com'])
@@ -57,11 +61,27 @@ sys.exit(result)
 
     def test_an_occupied_operation_lock_does_not_block_menu_or_read_only_commands(self):
         with mock.patch.object(cli, 'DATA', self.data), cli.operation_lock():
-            for command in ([], ['menu'], ['list'], ['status']):
+            for command in ([], ['menu'], ['list'], ['status'], ['lock-status']):
                 with self.subTest(command=command):
                     result = self.run_child(command)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertNotIn('MUTATION_EXECUTED', result.stdout)
+
+    def test_lock_status_reports_actual_owner_while_lock_is_held(self):
+        with mock.patch.object(cli, 'DATA', self.data), cli.operation_lock():
+            result = self.run_child(['lock-status'])
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            status = json.loads(result.stdout)
+            self.assertIs(status['locked'], True)
+            self.assertEqual(status['lock_file'], str(self.data / 'operation.lock'))
+            self.assertTrue(any(holder['pid'] == os.getpid() and holder['mode'] == 'WRITE'
+                                for holder in status['holders']), status)
+        released = self.run_child(['lock-status'])
+        self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
+        released_status = json.loads(released.stdout)
+        self.assertIsNone(released_status['locked'])
+        self.assertEqual(released_status['holders'], [])
+        self.assertEqual(released_status['reason'], 'no-visible-owner')
 
     def test_lock_is_released_when_an_operation_raises(self):
         with mock.patch.object(cli, 'DATA', self.data):

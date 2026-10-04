@@ -100,6 +100,98 @@ class ManagerTests(unittest.TestCase):
         self.web.obtain_certificate.assert_called_once_with(
             "alias.example.com", self.site["email"], self.site["root"])
 
+    def test_legacy_secondary_records_remain_redirects_and_lookup_includes_alias(self):
+        self.site['secondary'] = ['redirect.example.com']
+        self.site['aliases'] = ['alias.example.com']
+        self.manager.save_site(self.site)
+        self.assertEqual(core.site_hosts(self.site),
+                         ['old.example.com', 'alias.example.com', 'redirect.example.com'])
+        for hostname in core.site_hosts(self.site):
+            self.assertEqual(self.manager.site(hostname), self.site)
+        self.assertEqual(self.manager.site('alias.example.com')['secondary'],
+                         ['redirect.example.com'])
+
+    def test_alias_domains_are_reserved_against_other_sites_and_phpmyadmin(self):
+        self.site['aliases'] = ['alias.example.com']
+        self.manager.save_site(self.site)
+        with self.assertRaisesRegex(ValueError, 'sudah dipakai situs lain'):
+            self.manager.ensure_free_domain('alias.example.com')
+        self.assertEqual(self.manager.ensure_free_domain('alias.example.com', self.site['id']),
+                         'alias.example.com')
+        with self.assertRaises(ValueError):
+            self.manager.install_pma('alias.example.com', self.site['email'])
+
+    def test_add_domain_defaults_to_alias_and_preserves_legacy_redirects(self):
+        self.site['secondary'] = ['redirect.example.com']
+        self.manager.save_site(self.site)
+        result = self.manager.add_domain(self.site['id'], 'alias.example.com')
+        self.assertEqual(result['primary'], self.site['primary'])
+        self.assertEqual(result['aliases'], ['alias.example.com'])
+        self.assertEqual(result['secondary'], ['redirect.example.com'])
+        self.assertIn('alias.example.com', result['tls'])
+        self.assertEqual(self.manager.site('alias.example.com'), result)
+        self.assertFalse(any('search-replace' in argv for argv, _ in self.commands))
+
+    def test_www_aliases_commit_together_after_both_certificates(self):
+        states_at_issue = []
+
+        def certificate(host, email, root):
+            states_at_issue.append(self.manager.site(self.site['id']))
+
+        self.web.obtain_certificate.side_effect = certificate
+        result = self.manager.add_domain(self.site['id'], 'alias.example.com', www=True)
+        self.assertEqual(result['aliases'], ['alias.example.com', 'www.alias.example.com'])
+        self.assertEqual(states_at_issue, [self.site, self.site])
+        self.assertEqual(self.web.obtain_certificate.call_args_list, [
+            mock.call('alias.example.com', self.site['email'], self.site['root']),
+            mock.call('www.alias.example.com', self.site['email'], self.site['root']),
+        ])
+        self.assertTrue(set(result['aliases']).issubset(result['tls']))
+
+    def test_www_redirects_use_the_redirect_role(self):
+        result = self.manager.add_domain(self.site['id'], 'redirect.example.com',
+                                         kind='redirect', www=True)
+        self.assertEqual(result['secondary'],
+                         ['redirect.example.com', 'www.redirect.example.com'])
+        self.assertEqual(result.get('aliases', []), [])
+
+    def test_www_validation_failure_does_not_partially_add_bare_domain(self):
+        extra = {**self.site, 'id': '111111111111', 'primary': 'www.alias.example.com'}
+        self.manager.save_site(extra)
+        with self.assertRaises(ValueError):
+            self.manager.add_domain(self.site['id'], 'alias.example.com', www=True)
+        self.assertEqual(self.manager.site(self.site['id']), self.site)
+        self.web.write_site.assert_not_called()
+        self.web.obtain_certificate.assert_not_called()
+
+    def test_www_second_certificate_failure_rolls_back_every_domain(self):
+        self.web.obtain_certificate.side_effect = [None, RuntimeError('www certificate failed')]
+        with mock.patch.object(self.manager, 'delete_certificate') as cleanup:
+            with self.assertRaisesRegex(RuntimeError, 'www certificate failed'):
+                self.manager.add_domain(self.site['id'], 'alias.example.com', www=True)
+        self.assertEqual(self.manager.site(self.site['id']), self.site)
+        self.assertEqual(self.web.write_site.call_args.args[0], self.site)
+        self.assertEqual(cleanup.call_args_list,
+                         [mock.call('alias.example.com'), mock.call('www.alias.example.com')])
+
+    def test_failed_add_preserves_a_preexisting_certificate(self):
+        self.web.certificate_ready.return_value = True
+        self.web.obtain_certificate.side_effect = RuntimeError('certificate failed')
+        with mock.patch.object(self.manager, 'delete_certificate') as cleanup:
+            with self.assertRaises(RuntimeError):
+                self.manager.add_domain(self.site['id'], 'alias.example.com')
+        cleanup.assert_not_called()
+        self.assertEqual(self.manager.site(self.site['id']), self.site)
+
+    def test_add_domain_rejects_duplicate_and_unknown_role_before_mutating(self):
+        self.site['aliases'] = ['alias.example.com']
+        self.manager.save_site(self.site)
+        for hostname, kind in [('alias.example.com', 'alias'), ('other.example.com', 'primary')]:
+            with self.subTest(hostname=hostname), self.assertRaises(ValueError):
+                self.manager.add_domain(self.site['id'], hostname, kind=kind)
+        self.web.write_site.assert_not_called()
+        self.web.obtain_certificate.assert_not_called()
+
     def test_secondary_certificate_failure_restores_original_configuration_and_state(self):
         self.web.obtain_certificate.side_effect = RuntimeError("certificate failed")
         with self.assertRaises(RuntimeError):
@@ -139,6 +231,68 @@ class ManagerTests(unittest.TestCase):
             changed, _ = self.manager.change_primary(self.site["id"], "new.example.com")
         self.assertEqual(changed["secondary"], ["keep.example.com"])
         self.assertEqual(changed["tls"], ["new.example.com", "keep.example.com"])
+
+    def test_set_primary_promotes_alias_and_keeps_old_primary_as_alias(self):
+        self.site['aliases'] = ['new.example.com', 'keep.example.com']
+        self.site['secondary'] = ['redirect.example.com']
+        self.site['tls'] += self.site['aliases'] + self.site['secondary']
+        self.manager.save_site(self.site)
+        with mock.patch.object(self.manager, 'backup', return_value=self.base / 'backup'), \
+             mock.patch.object(self.manager, 'delete_certificate') as cleanup:
+            changed, _ = self.manager.set_primary(self.site['id'], 'new.example.com')
+        self.assertEqual(changed['primary'], 'new.example.com')
+        self.assertEqual(changed['aliases'], ['keep.example.com', 'old.example.com'])
+        self.assertEqual(changed['secondary'], ['redirect.example.com'])
+        self.assertIn('old.example.com', changed['tls'])
+        self.assertNotIn('new.example.com', changed['aliases'] + changed['secondary'])
+        self.assertEqual(self.manager.site('old.example.com'), changed)
+        cleanup.assert_not_called()
+        option_updates = [argv for argv, _ in self.commands if 'option' in argv]
+        self.assertEqual(len(option_updates), 2)
+        self.assertTrue(all(argv[-1] == 'https://new.example.com' for argv in option_updates))
+        self.assertEqual(len([argv for argv, _ in self.commands if 'search-replace' in argv]), 6)
+
+    def test_set_primary_old_domain_can_become_redirect_or_be_removed(self):
+        for old_role in ['redirect', 'remove']:
+            with self.subTest(old_role=old_role):
+                self.site['aliases'] = ['new.example.com']
+                self.manager.save_site(self.site)
+                with mock.patch.object(self.manager, 'backup', return_value=self.base / 'backup'), \
+                     mock.patch.object(self.manager, 'delete_certificate') as cleanup:
+                    changed, _ = self.manager.set_primary(self.site['id'], 'new.example.com',
+                                                          old_domain=old_role)
+                if old_role == 'redirect':
+                    self.assertEqual(changed['secondary'], ['old.example.com'])
+                    self.assertIn('old.example.com', changed['tls'])
+                    cleanup.assert_not_called()
+                else:
+                    self.assertNotIn('old.example.com', core.site_hosts(changed))
+                    self.assertNotIn('old.example.com', changed['tls'])
+                    cleanup.assert_called_once_with('old.example.com')
+
+    def test_set_primary_requires_registered_alias_and_rejects_current_primary(self):
+        self.site['secondary'] = ['redirect.example.com']
+        self.manager.save_site(self.site)
+        with mock.patch.object(self.manager, 'backup') as backup:
+            for host in ['unknown.example.com', 'redirect.example.com', 'old.example.com']:
+                with self.subTest(host=host), self.assertRaises(ValueError):
+                    self.manager.set_primary(self.site['id'], host)
+        backup.assert_not_called()
+        self.web.write_site.assert_not_called()
+
+    def test_failed_alias_promotion_restores_original_roles_and_database(self):
+        self.site['aliases'] = ['new.example.com', 'keep.example.com']
+        self.site['secondary'] = ['redirect.example.com']
+        self.manager.save_site(self.site)
+        snapshot = self.base / 'backup'
+        self.web.write_site.side_effect = [None, RuntimeError('reload failed'), None]
+        with mock.patch.object(self.manager, 'backup', return_value=snapshot), \
+             mock.patch.object(self.manager, 'restore_database') as restore:
+            with self.assertRaisesRegex(RuntimeError, 'database dan konfigurasi dikembalikan'):
+                self.manager.set_primary(self.site['id'], 'new.example.com')
+        self.assertEqual(self.manager.site(self.site['id']), self.site)
+        restore.assert_called_once_with(self.site, snapshot)
+        self.assertEqual(self.web.write_site.call_args.args[0], self.site)
 
     def test_search_replace_failure_imports_backup_and_restores_domain(self):
         snapshot = self.base / "backup"
@@ -204,6 +358,41 @@ class ManagerTests(unittest.TestCase):
                 self.manager.remove_secondary(self.site["id"], self.site["primary"])
         backup.assert_not_called()
         self.web.write_site.assert_not_called()
+
+    def test_delete_alias_removes_only_domain_and_certificate_reference(self):
+        self.site['aliases'] = ['alias.example.com', 'keep.example.com']
+        self.site['tls'] += self.site['aliases']
+        self.manager.save_site(self.site)
+        with mock.patch.object(self.manager, 'backup') as backup, \
+             mock.patch.object(self.manager, 'delete_certificate') as cleanup:
+            changed = self.manager.remove_domain(self.site['id'], 'alias.example.com')
+        self.assertEqual(changed['primary'], self.site['primary'])
+        self.assertEqual(changed['aliases'], ['keep.example.com'])
+        self.assertNotIn('alias.example.com', changed['tls'])
+        for key in ['root', 'db_name', 'db_user']:
+            self.assertEqual(changed[key], self.site[key])
+        backup.assert_called_once_with(self.site['id'])
+        cleanup.assert_called_once_with('alias.example.com')
+        self.assertEqual(self.commands, [])
+
+    def test_delete_primary_or_unknown_domain_refuses_before_backup(self):
+        with mock.patch.object(self.manager, 'backup') as backup:
+            for host in ['old.example.com', 'unknown.example.com']:
+                with self.subTest(host=host), self.assertRaises(ValueError):
+                    self.manager.remove_domain(self.site['id'], host)
+        backup.assert_not_called()
+        self.web.write_site.assert_not_called()
+
+    def test_delete_alias_web_failure_preserves_domain_state_and_certificate(self):
+        self.site['aliases'] = ['alias.example.com']
+        self.manager.save_site(self.site)
+        self.web.write_site.side_effect = [RuntimeError('reload failed'), None]
+        with mock.patch.object(self.manager, 'backup'), \
+             mock.patch.object(self.manager, 'delete_certificate') as cleanup:
+            with self.assertRaisesRegex(RuntimeError, 'reload failed'):
+                self.manager.remove_domain(self.site['id'], 'alias.example.com')
+        self.assertEqual(self.manager.site(self.site['id']), self.site)
+        cleanup.assert_not_called()
 
     def test_install_passwords_use_stdin_not_process_arguments(self):
         password = "ExampleSecretPassword123!"
@@ -278,6 +467,22 @@ class ManagerTests(unittest.TestCase):
         self.web.certificate_ready.return_value = True
         self.manager.delete_certificate(self.site["primary"])
         self.assertEqual(self.commands, [])
+
+    def test_alias_certificate_remains_while_referenced(self):
+        self.site['aliases'] = ['alias.example.com']
+        self.manager.save_site(self.site)
+        self.web.certificate_ready.return_value = True
+        self.manager.delete_certificate('alias.example.com')
+        self.assertEqual(self.commands, [])
+
+    def test_ssl_renewal_includes_alias_and_redirect_domains(self):
+        self.site['aliases'] = ['alias.example.com']
+        self.site['secondary'] = ['redirect.example.com']
+        self.manager.save_site(self.site)
+        renewed = self.manager.renew_ssl(self.site['id'])
+        self.assertEqual([call.args[0] for call in self.web.obtain_certificate.call_args_list],
+                         core.site_hosts(self.site))
+        self.assertEqual(set(renewed['tls']), set(core.site_hosts(self.site)))
 
     def test_replacement_boundaries_do_not_change_similar_domains(self):
         pairs = self.manager.replacement_pairs("old.example.com", "new.example.com")
@@ -356,6 +561,59 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual((root / "index.php").read_text(), "current-content")
         self.assertEqual(self.manager.site(current["id"]), current)
         self.assertEqual(self.web.write_site.call_args.args[0], current)
+        database.assert_not_called()
+
+    def test_restore_reissues_alias_and_redirect_certificates_before_replacing_files(self):
+        self.site['aliases'] = ['alias.example.com']
+        self.site['secondary'] = ['redirect.example.com']
+        self.site['tls'] += self.site['aliases'] + self.site['secondary']
+        self.manager.save_site(self.site)
+        root = Path(self.site['root'])
+        root.mkdir(parents=True)
+        (root / 'index.php').write_text('backup-content')
+        snapshot = self.manager.backup(self.site['id'])
+        current = {**self.site, 'primary': 'new.example.com', 'aliases': [],
+                   'secondary': [], 'tls': ['new.example.com']}
+        self.manager.save_site(current)
+        (root / 'index.php').write_text('current-content')
+        ready = {'new.example.com'}
+        self.web.certificate_ready.side_effect = lambda host: host in ready
+
+        def issue(host, email, webroot):
+            self.assertEqual((root / 'index.php').read_text(), 'current-content')
+            ready.add(host)
+
+        self.web.obtain_certificate.side_effect = issue
+        with mock.patch.object(self.manager, 'restore_database'):
+            restored, _ = self.manager.restore(current['id'], snapshot)
+        self.assertEqual([call.args[0] for call in self.web.obtain_certificate.call_args_list],
+                         core.site_hosts(self.site))
+        self.assertEqual(restored['aliases'], self.site['aliases'])
+        self.assertEqual(restored['secondary'], self.site['secondary'])
+        self.assertEqual(set(restored['tls']), set(core.site_hosts(self.site)))
+        self.assertEqual((root / 'index.php').read_text(), 'backup-content')
+
+    def test_restore_refuses_alias_now_owned_by_another_site_before_changing_content(self):
+        self.site['aliases'] = ['alias.example.com']
+        self.manager.save_site(self.site)
+        root = Path(self.site['root'])
+        root.mkdir(parents=True)
+        (root / 'index.php').write_text('backup-content')
+        snapshot = self.manager.backup(self.site['id'])
+        current = {**self.site, 'aliases': []}
+        self.manager.save_site(current)
+        self.manager.save_site({**self.site, 'id': '111111111111', 'primary': 'other.example.com'})
+        (root / 'index.php').write_text('current-content')
+        self.web.reset_mock()
+        with mock.patch.object(self.manager, 'backup') as safety, \
+             mock.patch.object(self.manager, 'restore_database') as database:
+            with self.assertRaisesRegex(ValueError, 'sudah dipakai situs lain'):
+                self.manager.restore(current['id'], snapshot)
+        self.assertEqual((root / 'index.php').read_text(), 'current-content')
+        self.assertEqual(self.manager.site(current['id']), current)
+        self.web.write_site.assert_not_called()
+        self.web.obtain_certificate.assert_not_called()
+        safety.assert_not_called()
         database.assert_not_called()
 
     def test_existing_setup_cannot_switch_stack_or_database(self):

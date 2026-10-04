@@ -9,6 +9,7 @@ import sys
 
 from . import __version__
 from .core import Manager, DATA
+from .locking import operation_lock_status, lock_busy_message
 
 
 def ask(label, default=None):
@@ -36,8 +37,10 @@ def show_sites(manager):
         print('Belum ada situs.')
     for site in sites:
         print(f'{site["id"]}  {site["primary"]}  [{site["status"]}]')
-        if site['secondary']:
-            print('              Secondary -> 301: ' + ', '.join(site['secondary']))
+        if site.get('aliases'):
+            print('              Alias: ' + ', '.join(site['aliases']))
+        if site.get('secondary'):
+            print('              Redirect -> Primary (301): ' + ', '.join(site['secondary']))
     return sites
 
 
@@ -107,11 +110,38 @@ def confirm(text, token):
         raise ValueError('Operasi dibatalkan.')
 
 
+def add_domain_interactive(manager):
+    identifier = select_site(manager)
+    host = ask('Domain baru')
+    kind = ask('Jenis domain: 1=Alias, 2=Redirect ke primary (301)', '1')
+    www = ask('Tambahkan www juga? 1=Ya, 2=Tidak', '2')
+    if kind not in ('1', '2') or www not in ('1', '2'):
+        raise ValueError('Pilihan harus 1 atau 2.')
+    role = 'alias' if kind == '1' else 'redirect'
+    site = run_operation(manager.add_domain, identifier, host, kind=role, www=www == '1')
+    if role == 'alias':
+        print(f'Alias terpasang: {host}; menggunakan situs {site["primary"]}.')
+    else:
+        print('Redirect terpasang -> https://' + site['primary'] + ' (301).')
+
+
+def set_primary_interactive(manager):
+    identifier = select_site(manager)
+    aliases = manager.site(identifier).get('aliases', [])
+    if not aliases:
+        raise ValueError('Tambahkan domain sebagai Alias melalui Add domain terlebih dahulu.')
+    print('Alias yang dapat dijadikan primary: ' + ', '.join(aliases))
+    host = ask('Domain yang dijadikan primary', aliases[0] if len(aliases) == 1 else None)
+    confirm('URL WordPress akan diganti dan backup dibuat. Primary lama menjadi Alias.', host)
+    site, backup = run_operation(manager.set_primary, identifier, host)
+    print(f'Primary: {site["primary"]}\nBackup: {backup}')
+
+
 def menu(manager):
     choices = [
         ('1', 'Install WordPress otomatis'), ('2', 'Daftar situs & domain'),
-        ('3', 'Add domain'), ('4', 'Change domain primary'),
-        ('5', 'Delete domain secondary'), ('6', 'Install phpMyAdmin'),
+        ('3', 'Add domain'), ('4', 'Set as Primary'),
+        ('5', 'Delete domain'), ('6', 'Install phpMyAdmin'),
         ('7', 'Delete panel phpMyAdmin'), ('8', 'Backup situs + database'),
         ('9', 'Restore backup'), ('10', 'SSL / perbaiki instalasi SSL'),
         ('11', 'Update WordPress core'), ('12', 'Status & diagnosis'),
@@ -139,20 +169,15 @@ def menu(manager):
             elif choice == '2':
                 show_sites(manager)
             elif choice == '3':
-                site = run_operation(manager.add_secondary, select_site(manager), ask('Domain secondary baru'))
-                print('Secondary terpasang -> https://' + site['primary'] + ' (301).')
+                add_domain_interactive(manager)
             elif choice == '4':
-                identifier = select_site(manager)
-                host = ask('Domain primary baru')
-                confirm('URL database akan diganti, domain primary lama dilepas. Backup otomatis dibuat.', host)
-                site, backup = run_operation(manager.change_primary, identifier, host)
-                print(f'Primary: {site["primary"]}\nBackup: {backup}')
+                set_primary_interactive(manager)
             elif choice == '5':
                 identifier = select_site(manager)
-                host = ask('Domain secondary yang dilepas')
+                host = ask('Domain yang dihapus')
                 confirm('Lepas domain dari vhost dan SSL situs.', host)
-                run_operation(manager.remove_secondary, identifier, host)
-                print('Domain secondary dilepas.')
+                run_operation(manager.remove_domain, identifier, host)
+                print('Domain dilepas; situs dan database tetap tersedia.')
             elif choice == '6':
                 pma_interactive(manager)
             elif choice == '7':
@@ -197,7 +222,10 @@ def operation_lock():
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise ValueError('Operasi WPI lain sedang berjalan. Tunggu hingga selesai, lalu coba lagi.') from None
+            # A real holder exists. Match the descriptor's device/inode against
+            # kernel records; a leftover file or its contents prove nothing.
+            report = operation_lock_status(DATA, lock_stat=os.fstat(lock.fileno()))
+            raise ValueError(lock_busy_message(report)) from None
         try:
             yield
         finally:
@@ -217,6 +245,7 @@ def parser():
     commands.add_parser('menu')
     commands.add_parser('list')
     commands.add_parser('status')
+    commands.add_parser('lock-status', help='Lihat PID pemegang kunci operasi tanpa mengubah server.')
     commands.add_parser('autotune-enable', help='Aktivasi otomatis saat upgrade instalasi WPI.')
     commands.add_parser('autotune-tick', help='Perintah internal timer PHP-FPM.')
     commands.add_parser('autotune-status', help='Lihat kapasitas dan keputusan PHP-FPM otomatis.')
@@ -227,10 +256,15 @@ def parser():
         command = commands.add_parser(name)
         command.add_argument('domain', nargs='?')
         command.add_argument('--email')
-    for name in ('add-domain', 'change-domain', 'delete-domain'):
+    for name in ('add-domain', 'set-primary', 'change-domain', 'delete-domain'):
         command = commands.add_parser(name)
         command.add_argument('site')
         command.add_argument('domain')
+        if name == 'add-domain':
+            command.add_argument('--type', dest='kind', choices=['alias', 'redirect'], default='alias')
+            command.add_argument('--www', action='store_true', help='Tambahkan hostname www juga.')
+        elif name == 'set-primary':
+            command.add_argument('--old-domain', choices=['alias', 'redirect', 'remove'], default='alias')
     for name in ('backup', 'ssl', 'retry-install', 'update'):
         command = commands.add_parser(name)
         command.add_argument('site')
@@ -251,6 +285,9 @@ def main(argv=None):
         command = args.command or 'menu'
         # Menus do not hold a lock while waiting for input. The background
         # controller has its own lock; read-only commands need neither lock.
+        if command == 'lock-status':
+            print(json.dumps(operation_lock_status(DATA), ensure_ascii=False, sort_keys=True))
+            return 0
         if command == 'autotune-tick':
             print(json.dumps(manager.autotune_tick(), ensure_ascii=False, sort_keys=True))
             return 0
@@ -275,14 +312,18 @@ def main(argv=None):
             confirm('Hapus akses browser phpMyAdmin; database tetap tersedia.', 'HAPUS PANEL')
             run_operation(manager.remove_pma)
         elif command == 'add-domain':
-            run_operation(manager.add_secondary, args.site, args.domain)
+            run_operation(manager.add_domain, args.site, args.domain, kind=args.kind, www=args.www)
+        elif command == 'set-primary':
+            confirm('Jadikan Alias sebagai primary; URL WordPress diganti dan backup dibuat.', args.domain)
+            site, backup = run_operation(manager.set_primary, args.site, args.domain, old_domain=args.old_domain)
+            print(f'Primary: {site["primary"]}\nBackup: {backup}')
         elif command == 'change-domain':
             confirm('Ganti primary dan lepas domain lama; backup otomatis.', args.domain)
             site, backup = run_operation(manager.change_primary, args.site, args.domain)
             print(f'Primary: {site["primary"]}\nBackup: {backup}')
         elif command == 'delete-domain':
-            confirm('Lepas domain secondary.', args.domain)
-            run_operation(manager.remove_secondary, args.site, args.domain)
+            confirm('Lepas domain dari situs; file WordPress dan database tetap tersedia.', args.domain)
+            run_operation(manager.remove_domain, args.site, args.domain)
         elif command == 'backup':
             print(run_operation(manager.backup, args.site))
         elif command == 'restore':

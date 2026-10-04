@@ -17,6 +17,8 @@ from typing import Callable
 
 
 HEADER = "# Managed by WPI. Edit through the wpi CLI.\n"
+ALIAS_PLUGIN_HEADER = "<?php\n// Managed by WPI. Edit domains through the wpi CLI.\n"
+ALIAS_PLUGIN_NAME = "wpi-domain-aliases.php"
 _DOMAIN = re.compile(r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 _SITE_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
 _SAFE_PATH = re.compile(r"/[A-Za-z0-9_./-]+\Z")
@@ -76,17 +78,20 @@ class WebStack:
         if not isinstance(site, dict) or not _SITE_ID.fullmatch(str(site.get("id", ""))):
             raise ValueError("ID situs tidak valid.")
         primary = _domain(site["primary"])
-        aliases = site.get("secondary", [])
+        aliases = site.get("aliases", [])
+        redirects = site.get("secondary", [])
         tls = site.get("tls", [])
-        if not isinstance(aliases, list) or not isinstance(tls, list):
-            raise ValueError("Secondary dan TLS harus berupa daftar domain.")
+        if not all(isinstance(names, list) for names in (aliases, redirects, tls)):
+            raise ValueError("Alias, Redirect, dan TLS harus berupa daftar domain.")
         aliases = [_domain(name) for name in aliases]
-        if len(set([primary, *aliases])) != len(aliases) + 1:
+        redirects = [_domain(name) for name in redirects]
+        domains = [primary, *aliases, *redirects]
+        if len(set(domains)) != len(domains):
             raise ValueError("Domain situs duplikat.")
         tls = [_domain(name) for name in tls]
-        if not set(tls) <= set([primary, *aliases]):
+        if len(set(tls)) != len(tls) or not set(tls) <= set(domains):
             raise ValueError("TLS berisi domain yang tidak terpasang pada situs.")
-        return {**site, "primary": primary, "secondary": aliases,
+        return {**site, "primary": primary, "aliases": aliases, "secondary": redirects,
                 "root": _path(site["root"], ("/var/www/wpi",)), "tls": tls}
 
     def _ssl_nginx(self, domain: str) -> str:
@@ -225,34 +230,114 @@ class WebStack:
         target = f"{'https' if secure else 'http'}://{primary}"
         parts = [HEADER]
         if self.stack == "nginx":
-            if secure:
-                parts.append(self._nginx_redirect(primary, target, root, False))
-                parts.append("server {\n    listen 443 ssl;\n    listen [::]:443 ssl;\n"
-                             f"    server_name {primary};\n" + self._nginx_host(primary) + self._ssl_nginx(primary)
-                             + self._nginx_wordpress(root) + "}\n")
-            else:
-                parts.append("server {\n    listen 80;\n    listen [::]:80;\n"
-                             f"    server_name {primary};\n" + self._nginx_host(primary) + self._nginx_wordpress(root) + "}\n")
-            for alias in site["secondary"]:
-                parts.append(self._nginx_redirect(alias, target, root, False))
-                if alias in tls:
-                    parts.append(self._nginx_redirect(alias, target, root, True))
+            for domain in [primary, *site["aliases"]]:
+                domain_secure = domain in tls
+                if domain_secure:
+                    parts.append(self._nginx_redirect(domain, f"https://{domain}", root, False))
+                    parts.append("server {\n    listen 443 ssl;\n    listen [::]:443 ssl;\n"
+                                 f"    server_name {domain};\n" + self._nginx_host(domain) + self._ssl_nginx(domain)
+                                 + self._nginx_wordpress(root) + "}\n")
+                else:
+                    parts.append("server {\n    listen 80;\n    listen [::]:80;\n"
+                                 f"    server_name {domain};\n" + self._nginx_host(domain) + self._nginx_wordpress(root) + "}\n")
+            for domain in site["secondary"]:
+                parts.append(self._nginx_redirect(domain, target, root, False))
+                if domain in tls:
+                    parts.append(self._nginx_redirect(domain, target, root, True))
         else:
-            if secure:
-                parts.append(self._apache_redirect(primary, target, root, False))
-            parts.append(f"<VirtualHost *:{443 if secure else 80}>\n    ServerName {primary}\n"
-                         + self._apache_host(primary)
-                         + (self._ssl_apache(primary) if secure else "")
-                         + self._apache_wordpress(root) + "</VirtualHost>\n")
-            for alias in site["secondary"]:
-                parts.append(self._apache_redirect(alias, target, root, False))
-                if alias in tls:
-                    parts.append(self._apache_redirect(alias, target, root, True))
+            for domain in [primary, *site["aliases"]]:
+                domain_secure = domain in tls
+                if domain_secure:
+                    parts.append(self._apache_redirect(domain, f"https://{domain}", root, False))
+                parts.append(f"<VirtualHost *:{443 if domain_secure else 80}>\n    ServerName {domain}\n"
+                             + self._apache_host(domain)
+                             + (self._ssl_apache(domain) if domain_secure else "")
+                             + self._apache_wordpress(root) + "</VirtualHost>\n")
+            for domain in site["secondary"]:
+                parts.append(self._apache_redirect(domain, target, root, False))
+                if domain in tls:
+                    parts.append(self._apache_redirect(domain, target, root, True))
         return "\n".join(parts)
 
     def write_site(self, site: dict) -> None:
         site = self._site(site)
-        self._activate(f"wpi-{site['id']}.conf", self.render_site(site))
+        # Stage WordPress's in-memory URL aliases before exposing their vhost.
+        # Both files return to their former state on a failed activation.
+        plugin, previous, mode, changed = self._stage_alias_plugin(site)
+        try:
+            self._activate(f"wpi-{site['id']}.conf", self.render_site(site))
+        except BaseException:
+            if changed:
+                if previous is None:
+                    plugin.unlink(missing_ok=True)
+                else:
+                    self._atomic_file(plugin, previous, mode)
+            raise
+
+    def render_alias_plugin(self, site: dict) -> str:
+        """Keep WordPress links on explicitly configured Alias request hosts.
+
+        Database options remain canonical. Redirect domains deliberately never
+        enter this allowlist, and WP-CLI must always see the stored URLs.
+        """
+        site = self._site(site)
+        tls = set(site["tls"])
+        aliases = "\n".join(
+            f"    '{domain}' => '{'https' if domain in tls else 'http'}://{domain}',"
+            for domain in site["aliases"])
+        return (ALIAS_PLUGIN_HEADER
+                + "if (!defined('ABSPATH') || (defined('WP_CLI') && WP_CLI)) { return; }\n"
+                "// Reject unknown Host values before registering any URL filter.\n"
+                "$wpi_alias_host = strtolower((string) ($_SERVER['HTTP_HOST'] ?? ''));\n"
+                "if (!preg_match('/\\A([a-z0-9.-]+)(?::(?:80|443))?\\z/D', $wpi_alias_host, $wpi_alias_match)) { return; }\n"
+                "$wpi_aliases = array(\n" + aliases + "\n);\n"
+                "if (!isset($wpi_aliases[$wpi_alias_match[1]])) { return; }\n"
+                "$wpi_alias_origin = $wpi_aliases[$wpi_alias_match[1]];\n"
+                "$wpi_alias_url = static function ($url) use ($wpi_alias_origin) {\n"
+                "    return is_string($url) ? preg_replace('#\\Ahttps?://[^/]+#', $wpi_alias_origin, $url, 1) : $url;\n"
+                "};\n"
+                "add_filter('option_home', $wpi_alias_url, 20);\n"
+                "add_filter('option_siteurl', $wpi_alias_url, 20);\n"
+                "unset($wpi_alias_host, $wpi_alias_match, $wpi_aliases, $wpi_alias_origin, $wpi_alias_url);\n")
+
+    @staticmethod
+    def _alias_plugin_path(site: dict) -> Path:
+        expected = f"/var/www/wpi/{site['id']}/public"
+        if site["root"] != expected:
+            raise ValueError("Plugin Alias memerlukan document root situs WPI yang dikelola.")
+        root = Path(site["root"])
+        content = root / "wp-content"
+        directory = content / "mu-plugins"
+        plugin = directory / ALIAS_PLUGIN_NAME
+        for directory_path in (Path("/var/www/wpi"), root.parent, root, content, directory):
+            if directory_path.is_symlink():
+                raise RuntimeError("Menolak symlink direktori plugin Alias.")
+            if directory_path.exists() and not directory_path.is_dir():
+                raise RuntimeError("Direktori plugin Alias tidak valid.")
+        if plugin.is_symlink() or (plugin.exists() and not plugin.is_file()):
+            raise RuntimeError("Menolak symlink atau berkas plugin Alias yang tidak valid.")
+        real_root, real_plugin = root.resolve(), plugin.resolve()
+        if real_root not in real_plugin.parents:
+            raise ValueError("Plugin Alias keluar dari document root yang dikelola.")
+        return plugin
+
+    def _stage_alias_plugin(self, site: dict) -> tuple[Path, bytes | None, int, bool]:
+        plugin = self._alias_plugin_path(site)
+        previous = plugin.read_bytes() if plugin.exists() else None
+        mode = plugin.stat().st_mode & 0o777 if previous is not None else 0o644
+        if previous is not None and not previous.startswith(ALIAS_PLUGIN_HEADER.encode()):
+            raise RuntimeError("Plugin Alias sudah ada tetapi bukan milik WPI.")
+        desired = self.render_alias_plugin(site).encode() if site["aliases"] else None
+        if previous == desired:
+            return plugin, previous, mode, False
+        if desired is None:
+            plugin.unlink()
+        else:
+            if not plugin.parent.parent.is_dir():
+                raise RuntimeError("WordPress belum terpasang: wp-content tidak tersedia untuk Alias.")
+            plugin.parent.mkdir(mode=0o755, exist_ok=True)
+            self._atomic_file(plugin, desired, 0o644)
+        return plugin, previous, mode, True
 
     def install_default_guard(self) -> None:
         """Activate an HTTP fallback that serves no application content.
