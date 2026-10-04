@@ -151,7 +151,7 @@ class CliTests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()) as output:
             cli.menu(manager)
         text = output.getvalue()
-        for label in ["Install WordPress", "Add domain secondary", "Change domain primary",
+        for label in ["Install WordPress", "(3) Add domain", "Change domain primary",
                       "Install phpMyAdmin", "Delete panel phpMyAdmin", "Backup", "Restore", "Keluar"]:
             self.assertIn(label, text)
         manager.setup.assert_not_called()

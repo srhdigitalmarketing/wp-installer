@@ -110,7 +110,7 @@ def confirm(text, token):
 def menu(manager):
     choices = [
         ('1', 'Install WordPress otomatis'), ('2', 'Daftar situs & domain'),
-        ('3', 'Add domain secondary (301)'), ('4', 'Change domain primary'),
+        ('3', 'Add domain'), ('4', 'Change domain primary'),
         ('5', 'Delete domain secondary'), ('6', 'Install phpMyAdmin'),
         ('7', 'Delete panel phpMyAdmin'), ('8', 'Backup situs + database'),
         ('9', 'Restore backup'), ('10', 'SSL / perbaiki instalasi SSL'),

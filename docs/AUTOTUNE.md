@@ -6,8 +6,8 @@ WordPress; tidak perlu mengisi `memory_limit`, `pm.max_children`, atau nilai
 spare worker seperti pada panel web.
 
 Instalasi baru otomatis mengaktifkan fitur ini saat setup stack selesai.
-Pada server yang sudah memakai WPI v1.0.0, v1.1.0, atau v1.2.0, jalankan ulang
-bootstrap v1.2.1 sesuai [README](../README.md#instalasi-di-ubuntu). Stack yang sudah selesai
+Pada server yang sudah memakai WPI v1.0.0, v1.1.0, v1.2.0, atau v1.2.1, jalankan ulang
+bootstrap v1.2.2 sesuai [README](../README.md#instalasi-di-ubuntu). Stack yang sudah selesai
 disiapkan akan diaktifkan otomatis, sementara situs, database, domain, dan
 backup tetap digunakan.
 
