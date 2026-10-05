@@ -511,12 +511,32 @@ if stage == 'before-dns':
     assert not Path('/root/certbot-fixture-hosts').exists()
     print('Before DNS: imported SQL, admin, media, roles, HTTPS fallback and private routes verified; SSL waits for destination challenge.', flush=True)
 elif stage == 'after-dns':
+    def controller_diagnostics():
+        journal = json.loads(target._journal_path(report['migration_id']).read_text())
+        print('SSL retry state: ' + json.dumps({host: {
+            'status': value.get('status'), 'next_attempt': value.get('next_attempt')}
+            for host, value in journal['ssl'].items()}), flush=True)
+        for unit, properties in (
+                ('wpi-migration-ssl.service', ('ActiveState', 'SubState', 'Result',
+                 'ExecMainStatus', 'ExecMainCode', 'ExecMainStartTimestamp')),
+                ('wpi-migration-ssl.timer', ('ActiveState', 'SubState', 'LastTriggerUSec',
+                 'NextElapseUSecRealtime', 'NextElapseUSecMonotonic', 'AccuracyUSec'))):
+            diagnostic = subprocess.run(['systemctl', 'show', unit,
+                *['--property=' + value for value in properties]],
+                capture_output=True, text=True, check=False)
+            print(unit + ' scheduling state:\n' + diagnostic.stdout, flush=True)
+    for host in hosts:
+        if not target._http_probe(host, site['root']):
+            controller_diagnostics()
+            raise AssertionError('Destination HTTP challenge probe failed: ' + host)
+    print('After DNS: destination HTTP challenge routing passed for every domain.', flush=True)
     for attempt in range(60):
         status = target.status()['migrations'][0]
         if not status['ssl_pending']:
             break
         time.sleep(1)
     else:
+        controller_diagnostics()
         raise AssertionError(status)
     subprocess.run(['systemctl', 'stop', 'wpi-migration-ssl.timer'], check=True)
     assert all(status['ssl'][host] == 'ready' for host in hosts), status
@@ -552,7 +572,7 @@ for path in Path('/var/lib/wpi/migrations').glob('*.json'):
     path.write_text(json.dumps(journal))
 PY
 docker exec "$WPI_CI_TARGET" bash -c \
-    'mkdir -p /run/systemd/system/wpi-migration-ssl.timer.d; printf "[Timer]\nOnBootSec=\nOnBootSec=1s\nOnUnitInactiveSec=\nOnUnitInactiveSec=1s\nRandomizedDelaySec=0\n" > /run/systemd/system/wpi-migration-ssl.timer.d/ci.conf; systemctl daemon-reload; systemctl start wpi-migration-ssl.timer'
+    'mkdir -p /run/systemd/system/wpi-migration-ssl.timer.d; printf "[Timer]\nOnBootSec=\nOnBootSec=1s\nOnUnitInactiveSec=\nOnUnitInactiveSec=1s\nRandomizedDelaySec=0\nAccuracySec=100ms\n" > /run/systemd/system/wpi-migration-ssl.timer.d/ci.conf; systemctl daemon-reload; systemctl restart wpi-migration-ssl.timer'
 docker exec "$WPI_CI_TARGET" python3 -u /root/target-verify.py after-dns
 docker exec --interactive "$WPI_CI_SOURCE" python3 - <<'PY'
 import json
