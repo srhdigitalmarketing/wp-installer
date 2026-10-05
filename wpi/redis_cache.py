@@ -26,6 +26,7 @@ PLUGIN_VERSION = '3.0.0'
 # Official rhubarbgroup/redis-cache tag 3.0.0, includes/object-cache.php.
 DROPIN_SHA256 = '2e1758eb3049e0dd0d4e310cef4cfe2dd4359cf1c4c8bef47b65a80cacbed59d'
 HEADER = '# Managed by WPI Redis Object Cache.\n'
+ACL_HEADER = 'user wpi_managed_marker off\n'
 SERVICE = 'wpi-redis@.service'
 _ID = re.compile(r'[a-f0-9]{12}\Z')
 _SECRET = re.compile(r'[a-f0-9]{64}\Z')
@@ -193,10 +194,15 @@ class RedisCache:
 
     def _managed_write(self, path, content, mode=0o640):
         old = _bytes(path)
-        if old is not None and not old.startswith(HEADER.encode()):
+        expected = ACL_HEADER if path.suffix == '.acl' else HEADER
+        if old is not None and not old.startswith(expected.encode()):
             raise ValueError('Konfigurasi Redis/layanan lain sudah ada; tidak ditimpa.')
         if old == content.encode():
             return False
+        if path.parent != self.template.parent:
+            # Recursive mkdir under a restrictive root umask would otherwise
+            # leave /etc/wpi at 0700, preventing redis from reading its config.
+            _directory(self.etc / 'wpi', 0o755)
         _directory(path.parent, 0o755 if path.parent == self.template.parent else 0o750)
         if path.parent != self.template.parent:
             self.runner(['chown', 'root:redis', str(path.parent)])
@@ -295,7 +301,8 @@ class RedisCache:
                     '+incrby +decrby +expire +pexpire +ttl +pttl +type +scan '
                     '+ping +info +dbsize +flushdb +multi +exec +discard +watch '
                     '+unwatch +auth +quit +select +echo')
-        acl = (HEADER + 'user default off\n'
+        # Redis ACL files accept user declarations only, including no comments.
+        acl = (ACL_HEADER + 'user default off\n'
                f'user wpi_admin on #{digest(admin["password"])} ~* +@all\n'
                f'user {credentials["username"]} on #{digest(credentials["password"])} '
                f'~wpi:{identifier}:* -@all {commands}\n')
@@ -344,13 +351,28 @@ class RedisCache:
                      for key, path in self._paths(identifier).items() if key in ('config', 'acl')}
         snapshots[self.manager.data / 'config.json'] = self._saved(self.manager.data / 'config.json')
         live = {}
+        aggregate_rss, complete_rss = 0, True
         try:
             for identifier in identifiers:
                 if self._check(['systemctl', 'is-active', self.service(identifier)]):
                     with self._client(identifier) as client:
                         pair = client.command('CONFIG', 'GET', 'maxmemory')
                         live[identifier] = int(pair[1])
+                        info = str(client.command('INFO', 'memory'))
+                        match = re.search(r'^used_memory_rss:(\d+)\r?$', info, re.M)
+                        if match:
+                            aggregate_rss += int(match[1])
+                        else:
+                            complete_rss = False
                 self._instance(identifier, profile['per_site_maxmemory_mib'])
+            # Shrinking maxmemory does not immediately return allocator pages
+            # to the OS. Keep FPM out of those retained pages until they shrink.
+            observed_reserve = (aggregate_rss + MIB - 1) // MIB
+            if not complete_rss:
+                observed_reserve = max(observed_reserve, int(self.manager.config.get(
+                    'redis_cache', {}).get('reserve_mib', 0)))
+            profile['reserve_mib'] = max(profile['reserve_mib'], observed_reserve)
+            profile['memory_reserve_bytes'] = profile['reserve_mib'] * MIB
             self._save_policy(profile)
         except BaseException:
             self._restore(snapshots)
@@ -622,6 +644,8 @@ class RedisCache:
             return {'site_id': site['id'], 'enabled': False}
         snapshots = self._capture(site)
         self._backup(site, snapshots)
+        was_active = self._check(['systemctl', 'is-active', self.service(site['id'])])
+        was_enabled = self._check(['systemctl', 'is-enabled', self.service(site['id'])])
         try:
             if current is not None:
                 target.unlink()
@@ -631,7 +655,10 @@ class RedisCache:
             self.optimize()
         except BaseException:
             self._restore(snapshots)
-            self._check(['systemctl', 'enable', '--now', self.service(site['id'])])
+            if was_enabled:
+                self._check(['systemctl', 'enable', self.service(site['id'])])
+            if was_active:
+                self._check(['systemctl', 'start', self.service(site['id'])])
             raise
         return {'site_id': site['id'], 'enabled': False}
 

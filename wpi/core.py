@@ -172,7 +172,7 @@ class Manager:
 
     def enable_redis(self, identifier=None):
         if self.config.get('php_settings'):
-            from .autotune import detect_resources, profile
+            from .autotune import detect_resources, profile, redis_reserve_bytes
             from .php_settings import configured_profile
             from .redis_cache import redis_resource_profile
             resources = detect_resources()
@@ -182,8 +182,14 @@ class Manager:
                            site.get('redis_cache', {}).get('enabled') is not False)}
             if identifier is not None:
                 candidates.add(self.site(identifier)['id'])
+            current_cache = self.config.get('redis_cache', {})
+            resources['redis_cache'] = {**current_cache,
+                'memory_reserve_bytes': current_cache.get('reserve_mib', 0) * 1024 * 1024}
+            current_reserve = redis_reserve_bytes(resources)
             resources['redis_cache'] = redis_resource_profile(
                 resources['memory_total'], max(1, len(candidates)))
+            resources['redis_cache']['memory_reserve_bytes'] = max(
+                current_reserve, resources['redis_cache']['memory_reserve_bytes'])
             configured_profile(profile(resources), self.config['php_settings'],
                                resources, check_capacity=True)
         self.redis.install()

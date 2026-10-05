@@ -92,6 +92,30 @@ class RedisManagerHooksTests(unittest.TestCase):
         self.manager.performance_tick()
         self.assertEqual(self.cache.mock_calls, [mock.call.optimize()])
 
+    def test_cache_install_checks_manual_php_budget_before_mutations(self):
+        cfg = self.manager.config
+        cfg['php_settings'] = {'memory_limit_mb': 450}
+        cfg['redis_cache'] = {'enabled': False}
+        core.atomic_json(self.manager.data / 'config.json', cfg)
+        resources = {'memory_total': 1024 ** 3, 'memory_available': 900 * 1024 ** 2,
+                     'cpus': 2.0, 'worker_rss': [], 'telemetry_ok': True}
+        with mock.patch('wpi.autotune.detect_resources', return_value=resources):
+            with self.assertRaises(ValueError):
+                self.manager.enable_redis()
+        self.cache.install.assert_not_called()
+
+    def test_cache_install_keeps_current_rss_reservation_during_downsize(self):
+        cfg = self.manager.config
+        cfg['php_settings'] = {'memory_limit_mb': 500}
+        cfg['redis_cache'].update(reserve_mib=950)
+        core.atomic_json(self.manager.data / 'config.json', cfg)
+        resources = {'memory_total': 2 * 1024 ** 3, 'memory_available': 1500 * 1024 ** 2,
+                     'cpus': 2.0, 'worker_rss': [], 'telemetry_ok': True}
+        with mock.patch('wpi.autotune.detect_resources', return_value=resources):
+            with self.assertRaises(ValueError):
+                self.manager.enable_redis()
+        self.cache.install.assert_not_called()
+
     def test_diagnosis_does_not_start_stopped_cache(self):
         self.site['redis_cache']['enabled'] = True
         self.manager.save_site(self.site)

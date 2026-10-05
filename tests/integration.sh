@@ -316,6 +316,55 @@ def cache_probe(site, key, expected=None):
     return json.loads(manager.wp(site, 'eval', script).stdout)
 
 
+def redis_failure_diagnostics():
+    """Classify disposable Redis errors without printing config, ACL, or secrets."""
+    try:
+        inventory = subprocess.run(['systemctl', 'list-units', '--all', '--plain', '--no-legend',
+                                    'wpi-redis@*.service'], capture_output=True, text=True, timeout=15)
+        units = sorted(set(re.findall(r'wpi-redis@[a-f0-9]{12}\.service', inventory.stdout)) |
+                       {'wpi-redis@' + site['id'] + '.service' for site in manager.sites()
+                        if re.fullmatch('[a-f0-9]{12}', str(site.get('id', '')))})
+        paths = [Path('/etc/wpi'), Path('/etc/wpi/redis')]
+        patterns = {'acl_user_keyword': 'should start with user keyword',
+                    'acl_load_error': 'error loading acl', 'config_error': 'fatal config file error',
+                    'permission_denied': 'permission denied', 'missing_file': 'no such file',
+                    'address_family': 'address family not supported', 'ready': 'ready to accept'}
+        for unit in units:
+            identifier = unit.split('@')[1].split('.')[0]
+            properties = ('LoadState', 'ActiveState', 'SubState', 'Result', 'ExecMainStatus',
+                          'ExecMainCode', 'User', 'Group', 'RuntimeDirectoryMode')
+            state = subprocess.run(['systemctl', 'show', unit,
+                                    *['--property=' + key for key in properties]],
+                                   capture_output=True, text=True, timeout=15)
+            fields = dict(line.split('=', 1) for line in state.stdout.splitlines() if '=' in line)
+            journal = subprocess.run(['journalctl', '--unit', unit, '--no-pager', '--output=cat', '--lines=60'],
+                                     capture_output=True, text=True, timeout=15).stdout.lower()
+            counts = {key: journal.count(value) for key, value in patterns.items()}
+            print('Safe Redis service diagnostic: ' + json.dumps({'unit': unit,
+                  'state': {key: fields.get(key) for key in properties}, 'journal_categories': counts}), flush=True)
+            paths.extend([Path('/etc/wpi/redis') / (identifier + suffix) for suffix in ('.conf', '.acl')])
+            paths.append(Path('/run') / ('wpi-redis-' + identifier))
+        permissions = []
+        for path in paths:
+            try:
+                metadata = path.stat()
+                permissions.append({'path': str(path), 'mode': oct(metadata.st_mode & 0o777),
+                                    'uid': metadata.st_uid, 'gid': metadata.st_gid})
+            except OSError:
+                permissions.append({'path': str(path), 'missing': True})
+        print('Safe Redis path permissions: ' + json.dumps(permissions), flush=True)
+    except (OSError, subprocess.SubprocessError):
+        print('Safe Redis diagnostics unavailable.', flush=True)
+
+
+def install_with_redis_diagnostics(*args, **kwargs):
+    try:
+        return manager.install(*args, **kwargs)
+    except Exception:
+        redis_failure_diagnostics()
+        raise
+
+
 def verify_redis_cache(site):
     """Real plugin/Redis persistence, SQL reduction, isolation, and explicit recovery."""
     site = manager.site(site['id'])
@@ -339,8 +388,8 @@ def verify_redis_cache(site):
         assert status == 200 and code == 0
         assert json.loads(body) == {'persistent': True, 'found': True, 'matches': True}
 
-        peer, _ = manager.install('wpi-cache-peer.example.com', 'owner@example.com',
-                                  admin='cachepeer', password='CiPeerWordPressPassword123!')
+        peer, _ = install_with_redis_diagnostics('wpi-cache-peer.example.com', 'owner@example.com',
+                                               admin='cachepeer', password='CiPeerWordPressPassword123!')
         peer = manager.site(peer['id'])
         assert peer['redis_cache']['enabled']
         assert peer['redis_cache']['socket'] != site['redis_cache']['socket']
@@ -573,7 +622,7 @@ def verify_repair_and_php_settings(site):
 
 with mock.patch.object(core, 'check_dns', return_value=None), \
      mock.patch.object(WebStack, 'obtain_certificate', local_certificate):
-    site, _ = manager.install(old, 'owner@example.com', admin='ciadmin', password='CiWordPressPassword123!')
+    site, _ = install_with_redis_diagnostics(old, 'owner@example.com', admin='ciadmin', password='CiWordPressPassword123!')
     manager.wp(site, 'core', 'is-installed')
     status, _, body, code = expected_request(old, 200)
     assert code == 0 and status == 200 and 'wp-content' in body, (status, body[:200])

@@ -76,6 +76,9 @@ cache sekitar 5% RAM efektif, dengan minimum 16 MiB untuk server dan
 RAM Redis sebesar dua kali anggaran data cache ditambah 10 MiB per instance
 memperhitungkan overhead proses; konfigurasi ditolak jika cadangan ini
 melebihi 20% RAM efektif.
+Jika pemakaian RSS instance yang masih berjalan lebih besar, cadangan memakai
+nilai RSS tersebut hingga memori benar-benar turun. Ini mencegah FPM menganggap
+memori allocator lama sudah bebas sesudah RAM VPS diperkecil.
 PHP-FPM dan batas PHP memperhitungkan cadangan Redis yang sama, di samping
 cadangan OS/database serta OPcache, sehingga
 penambahan situs tidak menganggap seluruh RAM tersedia lagi untuk setiap

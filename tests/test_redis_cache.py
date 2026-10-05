@@ -74,7 +74,8 @@ class FakeClient:
         if command == 'FLUSHALL' and self.username != 'wpi_admin':
             raise RedisProtocolError('Forbidden')
         if command == 'INFO':
-            return ('used_memory:1048576\r\nused_memory_rss:2097152\r\n'
+            rss = self.state.get('rss', 2 * MIB)
+            return (f'used_memory:1048576\r\nused_memory_rss:{rss}\r\n'
                     f'maxmemory:{self.state["limit"]}\r\nkeyspace_hits:7\r\n'
                     'keyspace_misses:2\r\nevicted_keys:0\r\nconnected_clients:1\r\n')
         if command == 'PING':
@@ -102,12 +103,14 @@ class Backend:
         elif argv[:2] == ['systemctl', 'is-active']:
             identifier = self.identifier(argv[-1])
             rc = 0 if identifier in self.active else 3
-        elif argv[:2] == ['systemctl', 'enable']:
+        elif argv[:2] == ['systemctl', 'enable'] and '--now' in argv:
             identifier = self.identifier(argv[-1])
             self.active.add(identifier)
             config = self.cache._paths(identifier)['config'].read_text()
             limit = int(re.search(r'^maxmemory (\d+)$', config, re.M)[1])
             self.instances.setdefault(identifier, {'keys': {}})['limit'] = limit
+        elif argv[:2] == ['systemctl', 'start']:
+            self.active.add(self.identifier(argv[-1]))
         elif argv[:2] == ['systemctl', 'disable']:
             self.active.discard(self.identifier(argv[-1]))
         return subprocess.CompletedProcess(argv, rc, out, '')
@@ -217,6 +220,8 @@ class ActivationTests(unittest.TestCase):
         self.assertIn('maxmemory-policy allkeys-lfu', config)
         self.assertNotIn(credential['password'], acl)
         self.assertIn('user default off', acl)
+        self.assertTrue(all(line.startswith('user ') for line in acl.splitlines()))
+        self.assertEqual(acl.splitlines()[0], 'user wpi_managed_marker off')
         self.assertIn('+flushdb', acl)
         self.assertNotIn('+flushall', acl)
         self.assertNotIn('+eval', acl)
@@ -316,6 +321,33 @@ class ActivationTests(unittest.TestCase):
             self.assertEqual((path.stat().st_mode, path.stat().st_uid, path.stat().st_gid), permissions[path])
         self.assertEqual(self.backend.instances[self.a]['limit'], old_limit)
         self.assertEqual(self.backend.instances[self.a]['keys']['sentinel'], 'keep')
+
+    def test_ram_downscale_retains_observed_allocator_rss_until_pages_are_released(self):
+        self.cache.enable_site(self.a)
+        self.backend.instances[self.a]['rss'] = 900 * MIB + 1
+        self.backend.memory = 2 * GIB
+        expected = redis_resource_profile(2 * GIB, 1)
+        report = self.cache.optimize()
+        self.assertEqual(report['maxmemory_mib'], expected['maxmemory_mib'])
+        self.assertEqual(self.manager.config['redis_cache']['reserve_mib'], 901)
+        self.assertEqual(report['memory_reserve_bytes'], 901 * MIB)
+        config = (self.data / 'config.json').read_bytes()
+        self.assertFalse(self.cache.optimize()['changed'])
+        self.assertEqual((self.data / 'config.json').read_bytes(), config)
+        self.backend.instances[self.a]['rss'] = 10 * MIB
+        self.cache.optimize()
+        self.assertEqual(self.manager.config['redis_cache']['reserve_mib'], expected['reserve_mib'])
+
+    def test_disable_failure_does_not_start_previously_stopped_instance(self):
+        self.cache.enable_site(self.a)
+        self.backend.active.remove(self.a)
+        self.backend.calls.clear()
+        with mock.patch.object(self.cache, 'optimize', side_effect=RuntimeError('resize failed')):
+            with self.assertRaises(RuntimeError):
+                self.cache.disable_site(self.a)
+        self.assertNotIn(self.a, self.backend.active)
+        self.assertTrue(self.manager.site(self.a)['redis_cache']['enabled'])
+        self.assertFalse(any(call[:2] == ['systemctl', 'start'] for call in self.backend.calls))
 
     def test_status_is_readonly_secrets_free_and_reports_aggregate_usage(self):
         self.cache.enable_site(self.a)
