@@ -314,6 +314,56 @@ class SettingsActivationTests(unittest.TestCase):
         self.assertEqual(report['effective'], autotune.profile(resources()))
         self.assertNotIn('php_admin_value', tuner.pool.read_text())
 
+    def test_automatic_web_ceiling_accommodates_php_profile_after_hardware_resize(self):
+        with mock.patch('wpi.autotune.detect_resources', return_value=resources(memory=0.5, cpus=1)):
+            report = self.settings.reset()
+            self.assertEqual(report['effective']['post_mib'], 40)
+            self.assertEqual(report['web_body_mib'], 320)
+        vhost = self.etc / 'nginx/sites-available' / f'wpi-{self.sites[0]["id"]}.conf'
+        before = vhost.read_bytes()
+        self.assertIn('client_max_body_size 320m;', before.decode())
+        tuner = self.settings._tuner()
+        with mock.patch('wpi.autotune.detect_resources', return_value=resources(memory=32, cpus=16)):
+            after = tuner._resources()
+            self.assertEqual(autotune.profile(after)['post_mib'], 144)
+            report = self.settings.status()
+            self.assertEqual(report['web_body_mib'], 320)
+            self.assertGreater(report['effective']['upload_mib'], 32)
+            self.assertGreater(report['effective']['post_mib'], 40)
+            self.assertLessEqual(report['effective']['post_mib'], report['web_body_mib'])
+        self.assertEqual(vhost.read_bytes(), before)
+
+    def test_explicit_memory_preserves_auto_web_ceiling_and_upload_auto_clears_web_pin(self):
+        report = self.settings.apply(memory_limit=500)
+        self.assertEqual(report['effective']['post_mib'], 144)
+        self.assertEqual(report['web_body_mib'], 320)
+        report = self.settings.apply(upload_max_filesize=8)
+        self.assertEqual(report['web_body_mib'], 16)
+        report = self.settings.apply(upload_max_filesize='auto')
+        self.assertEqual(report['manual'], {'memory_limit_mb': 500})
+        self.assertEqual(report['web_body_mib'], 320)
+        vhost = self.etc / 'nginx/sites-available' / f'wpi-{self.sites[0]["id"]}.conf'
+        self.assertIn('client_max_body_size 320m;', vhost.read_text())
+
+    def test_apache_upload_changes_update_body_directive_and_early_guard_for_wp_and_pma(self):
+        config = {**self.config, 'stack': 'apache',
+                  'phpmyadmin': {'domain': 'db.example.com', 'email': 'admin@example.com', 'user': 'panel'}}
+        (self.data / 'config.json').write_text(json.dumps(config))
+        cert = self.etc / 'letsencrypt/live/db.example.com'
+        cert.mkdir(parents=True)
+        for name in ('fullchain.pem', 'privkey.pem'):
+            (cert / name).write_text('fixture certificate')
+        names = [*[f'wpi-{site["id"]}.conf' for site in self.sites], WebStack._pma_filename('db.example.com')]
+        for upload, expected in ((8, 16), (32, 40), ('auto', 320)):
+            with self.subTest(upload=upload):
+                report = self.settings.apply(memory_limit=500, upload_max_filesize=upload)
+                self.assertEqual(report['web_body_mib'], expected)
+                for name in names:
+                    content = (self.etc / 'apache2/sites-available' / name).read_text()
+                    self.assertIn(f'LimitRequestBody {expected * autotune.MIB}', content)
+                    self.assertIn(f"req_novary('Content-Length') -gt {expected * autotune.MIB}", content)
+                    self.assertIn('RewriteRule ^ - [R=413,END]', content)
+
 
 if __name__ == '__main__':
     unittest.main()

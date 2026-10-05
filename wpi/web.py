@@ -181,7 +181,16 @@ class WebStack:
                 "    </Location>\n")
 
     def _apache_php(self) -> str:
-        return (f"    LimitRequestBody {self.post_max_size_mb * 1024 ** 2}\n"
+        body_bytes = self.post_max_size_mb * 1024 ** 2
+        # In proxy_fcgi, reading an oversized body can surface as a backend
+        # failure instead of HTTP 413. Reject a known Content-Length during
+        # vhost rewriting, before forwarding the body. The core directive
+        # remains for streamed requests without a declared length.
+        return (f"    LimitRequestBody {body_bytes}\n"
+                "    RewriteEngine On\n"
+                "    RewriteCond expr \"req_novary('Content-Length') =~ /^[0-9]+$/ "
+                f"&& req_novary('Content-Length') -gt {body_bytes}\"\n"
+                "    RewriteRule ^ - [R=413,END]\n"
                 "    ProxyTimeout 180\n"
                 "    <LocationMatch \"^/wpi-fpm-status(?:/|$)\">\n"
                 "        Require all denied\n"

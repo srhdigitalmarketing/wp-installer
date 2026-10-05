@@ -121,6 +121,12 @@ ceiling sehingga kode WordPress tidak dapat menaikkannya melampaui pengaturan
 terkelola. Limit terlalu besar untuk anggaran RAM saat ini ditolak sebelum
 diterapkan. `0`, nilai negatif, dan unlimited tidak didukung.
 
+Saat ukuran upload otomatis, batas body web tetap 320 MiB agar kenaikan profil
+PHP setelah RAM server di-scale tidak tertahan konfigurasi vhost lama. PHP tetap
+menegakkan batas upload dan POST efektif yang lebih kecil. Jika ukuran upload
+diatur manual, batas body web mengikuti batas POST tersebut. Status CLI
+menampilkan kedua batas ini secara terpisah.
+
 Konfigurasi manual disimpan di state WPI dan tetap digunakan saat controller
 FPM menyesuaikan jumlah worker atau membaca resource baru. Mode `auto`/reset
 memakai profil otomatis berdasarkan resource efektif server. Pengaturan

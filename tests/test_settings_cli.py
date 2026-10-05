@@ -9,7 +9,7 @@ from wpi import cli
 
 SETTINGS = {'scope': 'server', 'manual': {'memory_limit_mb': 500, 'upload_max_filesize_mb': 8},
             'effective': {'memory_mib': 500, 'upload_mib': 8, 'post_mib': 16, 'opcache_mib': 256},
-            'capacity': 30}
+            'capacity': 30, 'web_body_mib': 16}
 HEALTHY = {'primary': 'example.com', 'status': 'healthy', 'checks': {'config_syntax': True}}
 UNRESOLVED = {'primary': 'example.com', 'status': 'unresolved',
               'checks': {'config_syntax': False, 'frontend': {'status': 500, 'scheme': 'https', 'ok': False}}}

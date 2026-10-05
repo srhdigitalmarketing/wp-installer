@@ -113,12 +113,27 @@ class PHPSettings:
         clean = {key: value for key, value in resources.items() if key != 'php_settings'}
         return configured_profile(autotune.profile(clean), self.manager.config.get('php_settings', {}), clean)
 
+    def web_body_mib(self, effective=None, settings=None):
+        """Automatic uploads retain room for hardware profile changes.
+
+        PHP enforces the automatic upload/POST size. Its adaptive controller
+        can raise those values after a VPS resize without changing vhosts or
+        taking the WPI operation lock. Explicit uploads pin the web limit to
+        the matching POST size instead.
+        """
+        settings = _settings(self.manager.config.get('php_settings', {}) if settings is None else settings)
+        if 'upload_max_filesize_mb' not in settings:
+            return 320
+        effective = self.effective() if effective is None else effective
+        return effective['post_mib']
+
     def status(self):
         resources = self._resources()
         effective = self.effective(resources)
         manual = _settings(self.manager.config.get('php_settings', {}))
         bounded = {**resources, 'php_settings': manual}
         return {'scope': 'server', 'manual': manual, 'effective': effective,
+                'web_body_mib': self.web_body_mib(effective, manual),
                 'memory_total_mib': resources.get('memory_total', 0) // autotune.MIB,
                 'capacity': autotune.capacity(bounded)['capacity'],
                 'sites': [site['primary'] for site in self.manager.sites()]}
@@ -189,7 +204,7 @@ class PHPSettings:
                 raise RuntimeError('Autotune sedang berjalan; pengaturan PHP belum diubah.')
             from .web import WebStack
             web = WebStack(self.manager.runner, cfg['stack'], cfg['php_version'],
-                           post_max_size_mb=effective['post_mib'])
+                           post_max_size_mb=self.web_body_mib(effective, settings))
             service = 'nginx' if cfg['stack'] == 'nginx' else 'apache2'
             web.available = self.etc / service / 'sites-available'
             web.enabled = self.etc / service / 'sites-enabled'

@@ -121,8 +121,9 @@ class Manager:
         if not cfg:
             raise ValueError('Jalankan setup atau install WordPress terlebih dahulu.')
         from .php_settings import PHPSettings
+        settings = PHPSettings(self)
         return WebStack(self.runner, cfg['stack'], cfg['php_version'],
-                        post_max_size_mb=PHPSettings(self).effective()['post_mib'])
+                        post_max_size_mb=settings.web_body_mib())
 
     def remember_config(self, identifier):
         from .repair import SiteRepair

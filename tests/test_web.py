@@ -56,6 +56,19 @@ class WebRenderTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 WebStack(Mock(), 'nginx', '8.3', post_max_size_mb=value)
 
+    def test_apache_declared_body_uses_numeric_early_413_before_fastcgi_and_keeps_stream_limit(self):
+        web = WebStack(Mock(), 'apache', '8.3', post_max_size_mb=16)
+        condition = ("RewriteCond expr \"req_novary('Content-Length') =~ /^[0-9]+$/ "
+                     "&& req_novary('Content-Length') -gt 16777216\"")
+        with patch.object(web, 'certificate_ready', return_value=True):
+            for content in (web.render_site(SITE), web.render_phpmyadmin(
+                    'db.example.com', '/usr/share/phpmyadmin', '/etc/wpi/pma.htpasswd')):
+                self.assertIn('LimitRequestBody 16777216', content)
+                self.assertIn(condition, content)
+                self.assertIn('RewriteRule ^ - [R=413,END]', content)
+                self.assertLess(content.index(condition), content.index('SetHandler'))
+                self.assertNotIn('ErrorDocument 503', content)
+
     def test_nginx_http_permalink_php_and_upload_protection(self):
         result = self.stack().render_site(SITE)
         self.assertIn("try_files $uri $uri/ /index.php?$args", result)

@@ -185,7 +185,8 @@ def show_php_settings(report):
     manual = report['manual']
     print('Pengaturan PHP berlaku untuk seluruh situs WPI dan phpMyAdmin (pool bersama).')
     print(f"Memory: {effective['memory_mib']}M; "
-          f"upload: {effective['upload_mib']}M; POST/web: {effective['post_mib']}M.")
+          f"upload: {effective['upload_mib']}M; POST: {effective['post_mib']}M; "
+          f"web: {report.get('web_body_mib', effective['post_mib'])}M.")
     print('Memory: ' + ('manual' if 'memory_limit_mb' in manual else 'otomatis')
           + '; upload: ' + ('manual' if 'upload_max_filesize_mb' in manual else 'otomatis'))
     print(f"Kapasitas worker menurut resource: {report['capacity']}; "

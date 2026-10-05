@@ -142,7 +142,7 @@ class RepairTests(unittest.TestCase):
         report = self.repair.repair(self.site['id'])
         self.assertEqual(report['status'], 'resolved')
         action = next(a for a in report['actions'] if a['action'] == 'config_recovered')
-        self.assertEqual(action['source'], str(folder))
+        self.assertEqual(Path(action['source']).resolve(), folder.resolve())
         self.assertEqual((Path(action['preserved_config']) / 'wp-config.php').read_text(), '<?php BROKEN parse error')
         self.assertIn(self.password, self.config.read_text())
         self.assertNotIn('OLDPASSWORD', self.config.read_text())
@@ -188,7 +188,7 @@ class RepairTests(unittest.TestCase):
         report = self.repair.repair(self.site['id'])
         self.assertEqual(report['status'], 'resolved')
         action = next(a for a in report['actions'] if a['action'] == 'config_recovered')
-        self.assertEqual(action['source'], str(folder))
+        self.assertEqual(Path(action['source']).resolve(), folder.resolve())
         self.assertEqual(self.media.read_bytes(), b'NEW CONTENT MUST REMAIN')
         self.assertFalse(any('import' in args or 'export' in args for args, _ in self.wp_commands))
 
