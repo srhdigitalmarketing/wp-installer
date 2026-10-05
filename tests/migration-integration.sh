@@ -168,7 +168,16 @@ from wpi.ssh import SSHSession
 password = Path('/root/migration-password').read_text()
 source, target = sys.argv[1:]
 migrator = Migration(Manager())
-with SSHSession(target, 'root', password) as session:
+def root_probe_runner(argv, **kwargs):
+    # Diagnose only the first harmless id command. Authentication commands,
+    # upload payloads, later privileged scripts, argv, and stdin stay private.
+    probe = argv[0] == 'ssh' and argv[-1] == "sh -c 'id -u'"
+    result = subprocess.run([argv[0], '-vvv', *argv[1:]] if probe else argv, **kwargs)
+    if probe and result.returncode:
+        print('Disposable SSH root identity probe failed; bounded OpenSSH diagnostic:', flush=True)
+        print((result.stderr or '').replace(password, '[redacted]')[-8000:], flush=True)
+    return result
+with SSHSession(target, 'root', password, runner=root_probe_runner) as session:
     assert session.run_root('id -u').stdout.strip() == '0'
     fixture = Path('/root/ssh-upload-fixture.txt')
     fixture.write_text('WPI encrypted root transfer fixture')
