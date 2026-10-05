@@ -58,7 +58,7 @@ berkelanjutan. Penurunan batas resource harus tetap mengurangi target kapasitas.
 Angka tersebut adalah tes kebijakan dengan resource buatan, bukan pengujian
 512 proses produksi sungguhan.
 
-Untuk migrasi v1.4.0, tes source/target menggunakan paket backup buatan serta
+Untuk migrasi v1.5.0, tes source/target menggunakan paket backup buatan serta
 runner SSH/server palsu. Periksa checksum paket dan manifest per berkas,
 penolakan traversal ZIP/tar, symlink, hostname/ID/database tidak valid, dan
 konflik dengan situs/database tujuan. Pemindahan mempertahankan akun WordPress,
@@ -86,10 +86,28 @@ dipindahkan ke situs lain tidak boleh diaktifkan ulang oleh journal lama.
 
 ## Integrasi Ubuntu sekali pakai
 
+Unit repair memeriksa config rusak/hilang, snapshot dan checksum, pemulihan hanya
+config dari backup lama, prefix database yang diverifikasi, symlink, preservasi
+kredensial/domain, serta hasil unresolved untuk error plugin/theme. Diagnosis
+read-only tidak memperoleh kunci atau melakukan perubahan layanan.
+
+Pengaturan PHP diuji sebagai transaksi seluruh situs: kedua konstanta WordPress,
+INI FPM/CLI, batas request web/phpMyAdmin, rollback aktivasi gagal, reset otomatis,
+persistensi controller, dan penolakan limit di atas anggaran RAM.
+
 `tests/integration.sh` hanya boleh dijalankan di VM CI sekali pakai. Skrip ini
 memasang dan mengubah layanan sistem serta menghapus stack/data bawaan VM,
 sehingga menolak berjalan tanpa `CI=true`, `WPI_DISPOSABLE_VM=1`, dan akses root.
 Gunakan VM terpisah untuk Nginx dan Apache.
+
+Fixture baru sengaja merusak sintaks `wp-config.php`, memeriksa HTTPS HTTP 500,
+lalu menjalankan Repair sampai HTTP 200. Isi database, akun admin, dan media
+harus tetap sama; config rusak disimpan privat. Fixture juga mengukur limit
+500M/8M/POST 16M dari PHP-FPM sebenarnya, mengirim file 1/9/17 MiB, dan memeriksa
+upload berhasil, error upload PHP, serta HTTP 413 dari server web. Override harus
+bertahan saat autotune dan upgrade, lalu dapat di-reset ke otomatis. Sertifikat
+self-signed fixture dipercaya secara eksplisit untuk probe Repair; kode produksi
+tetap memvalidasi TLS.
 
 ```bash
 sudo env CI=true WPI_DISPOSABLE_VM=1 bash tests/integration.sh nginx

@@ -1,4 +1,8 @@
-# Migrasi otomatis WPI v1.4.0
+# Migrasi otomatis WPI v1.5.0
+
+Pengaturan memory/upload dari menu 17 ikut disalin dan diperiksa terhadap RAM
+server tujuan sebelum setup. Target yang terlalu kecil ditolak. Konfigurasi
+WordPress yang berhasil diimpor juga mendapat snapshot privat untuk menu Repair.
 
 Migrasi dijalankan dari **server lama**. Pilih **15 — Migrasi otomatis ke server
 baru**, lalu masukkan IP, username SSH, dan password server baru. Password tidak

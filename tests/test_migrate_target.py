@@ -167,6 +167,54 @@ class TargetImportTests(unittest.TestCase):
         self.manager.setup.assert_not_called()
         self.assertFalse(self.target.directory.exists())
 
+    def settings_bundle(self, settings):
+        data = payloads()
+        metadata = json.loads(data['metadata.json'])
+        metadata['source_config']['php_settings'] = settings
+        data['metadata.json'] = json.dumps(metadata).encode()
+        self.sha = write_bundle(self.bundle, data)
+
+    def test_manual_memory_rejected_before_target_setup_if_ram_is_too_small(self):
+        self.settings_bundle({'memory_limit_mb': 500, 'upload_max_filesize_mb': 128})
+        with patch('wpi.autotune.detect_resources', return_value={
+                'memory_total': 512 * 1024 ** 2, 'memory_available': 400 * 1024 ** 2,
+                'cpu_count': 2, 'telemetry_ok': True}):
+            with self.assertRaises(ValueError):
+                self.import_bundle()
+        self.manager.setup.assert_not_called()
+        self.manager.restore_database.assert_not_called()
+        self.assertEqual(self.manager.sites(), [])
+
+    def test_supported_manual_settings_apply_before_site_import(self):
+        self.settings_bundle({'memory_limit_mb': 500, 'upload_max_filesize_mb': 128})
+        self.manager.set_php_settings = Mock()
+        with patch('wpi.autotune.detect_resources', return_value={
+                'memory_total': 2 * 1024 ** 3, 'memory_available': 1800 * 1024 ** 2,
+                'cpu_count': 2, 'telemetry_ok': True}):
+            self.import_bundle()
+        self.manager.set_php_settings.assert_called_once_with(memory_limit=500, upload_max_filesize=128)
+        self.manager.restore_database.assert_called_once()
+
+    def test_partial_import_resume_keeps_already_applied_settings_without_linting_missing_config(self):
+        settings = {'memory_limit_mb': 500, 'upload_max_filesize_mb': 128}
+        self.settings_bundle(settings)
+        self.manager.set_php_settings = Mock()
+        cfg = self.manager.config
+        cfg['php_settings'] = settings
+        core.atomic_json(self.manager.data / 'config.json', cfg)
+        self.manager.save_site({**SITE, 'root': str(self.target.www / IDENT / 'public'),
+                                'status': 'migrating', 'migration_id': MIGRATION})
+        self.target._save({'schema': 1, 'direction': 'target', 'migration_id': MIGRATION,
+                           'sha256': self.sha, 'status': 'incomplete',
+                           'sites': {IDENT: {'status': 'importing'}}, 'ssl': {}})
+        with patch('wpi.autotune.detect_resources', return_value={
+                'memory_total': 2 * 1024 ** 3, 'memory_available': 1800 * 1024 ** 2,
+                'cpu_count': 2, 'telemetry_ok': True}):
+            report = self.import_bundle()
+        self.manager.set_php_settings.assert_not_called()
+        self.assertEqual(report['status'], 'ready')
+        self.manager.restore_database.assert_called_once()
+
     def test_insufficient_staging_disk_refuses_before_unzip_or_setup(self):
         with patch('wpi.migrate_target.shutil.disk_usage', return_value=Mock(free=0)):
             with self.assertRaisesRegex(ValueError, 'Ruang disk target'):

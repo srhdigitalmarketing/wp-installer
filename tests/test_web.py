@@ -44,6 +44,18 @@ class WebRenderTests(unittest.TestCase):
                     self.assertIn('/wpi-fpm-status', content)
                     self.assertIn('return 403' if name == 'nginx' else 'Require all denied', content)
 
+    def test_configured_body_limit_matches_php_post_size_on_both_stacks_and_pma(self):
+        for name in ('nginx', 'apache'):
+            web = WebStack(Mock(), name, '8.3', post_max_size_mb=282)
+            expected = 'client_max_body_size 282m;' if name == 'nginx' else 'LimitRequestBody 295698432'
+            with self.subTest(stack=name), patch.object(web, 'certificate_ready', return_value=True):
+                for content in (web.render_site(SITE), web.render_phpmyadmin(
+                        'db.example.com', '/usr/share/phpmyadmin', '/etc/wpi/pma.htpasswd')):
+                    self.assertIn(expected, content)
+        for value in (0, -1, 2048, True, '500m;evil'):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                WebStack(Mock(), 'nginx', '8.3', post_max_size_mb=value)
+
     def test_nginx_http_permalink_php_and_upload_protection(self):
         result = self.stack().render_site(SITE)
         self.assertIn("try_files $uri $uri/ /index.php?$args", result)

@@ -68,6 +68,12 @@ def ci_run(argv, **kwargs):
     env = os.environ.copy()
     env.update({'DEBIAN_FRONTEND': 'noninteractive', 'LC_ALL': 'C.UTF-8'})
     env.update(kwargs.pop('env', {}))
+    # Repair uses strict TLS validation. Trust only this fixture's own cert
+    # for its explicit loopback host probe; production code never disables TLS.
+    if argv[0] == 'curl' and '--resolve' in argv and '--insecure' not in argv:
+        host, port, address = argv[argv.index('--resolve') + 1].split(':')
+        if host.endswith('.example.com') and port == '443' and address == '127.0.0.1':
+            argv = [*argv, '--cacert', f'/etc/letsencrypt/live/{host}/fullchain.pem']
     result = subprocess.run(argv, env=env, check=False, **kwargs)
     if check and result.returncode:
         safe = ('core' in argv and 'verify-checksums' in argv) or any(
@@ -356,6 +362,103 @@ def verify_runcloud_domains(site, post):
     return manager.site(restored['id'])
 
 
+def verify_repair_and_php_settings(site):
+    """Actual HTTP 500 recovery and runtime/upload settings through installed CLI."""
+    root = Path(site['root'])
+    manager.wp(site, 'option', 'add', 'wpi_repair_sentinel', 'keep-database-content')
+    users = manager.wp(site, 'user', 'list', '--field=ID').stdout
+    tables = manager.wp(site, 'db', 'tables', '--all-tables-with-prefix').stdout
+    media = root / 'wp-content/uploads/wpi-repair-proof.txt'
+    media.parent.mkdir(parents=True, exist_ok=True)
+    media.write_text('retain media during config-only repair')
+    media_hash = manager.file_hash(media)
+    config = root / 'wp-config.php'
+    baseline = config.read_bytes()
+    snapshots = list((manager.data / 'config-snapshots' / site['id']).glob('*/COMPLETE'))
+    assert snapshots, 'Normal installation did not create a validated config snapshot.'
+    config.write_bytes(baseline + b"\ndefine('WP_MEMORY_LIMIT', '500M'\n")
+    subprocess.run(['systemctl', 'restart', f'php{manager.config["php_version"]}-fpm'], check=True)
+    assert expected_request(site['primary'], 500)[0] == 500, 'Broken config did not cause a genuine HTTP 500.'
+    diagnosis = manager.repair_site(site['id'], check_only=True)
+    assert diagnosis['status'] == 'unresolved' and not diagnosis['checks']['config_syntax']
+    broken = config.read_bytes()
+    report = manager.repair_site(site['id'])
+    assert report['status'] == 'resolved', report
+    assert report['before']['frontend']['status'] == 500 and report['checks']['frontend']['status'] == 200
+    assert not report['database_restored'] and not report['content_restored']
+    assert any(action['action'] == 'config_recovered' for action in report['actions']), report
+    preserved = Path(report['preserved_config']) / 'wp-config.php'
+    assert preserved.read_bytes() == broken and preserved.stat().st_mode & 0o777 == 0o600
+    assert manager.wp(site, 'option', 'get', 'wpi_repair_sentinel').stdout.strip() == 'keep-database-content'
+    assert manager.wp(site, 'user', 'list', '--field=ID').stdout == users
+    assert manager.wp(site, 'db', 'tables', '--all-tables-with-prefix').stdout == tables
+    assert manager.file_hash(media) == media_hash
+    assert request(site['primary'], '/wp-admin/')[0] in (200, 302)
+    print('Real HTTPS HTTP 500 from malformed wp-config recovered to HTTP 200; '
+          'admin users, database content, media, and private broken-config backup preserved.', flush=True)
+
+    # Apply through the real installed command, then measure actual PHP-FPM.
+    subprocess.run(['/usr/local/bin/wpi', 'php-settings', '--memory-limit', '500',
+                    '--upload-max-filesize', '8'], check=True, capture_output=True, text=True)
+    probe = root / 'wpi-ci-limits.php'
+    probe.write_text("<?php require __DIR__ . '/wp-load.php'; header('Content-Type: application/json'); "
+                     "echo json_encode(['memory'=>ini_get('memory_limit'), "
+                     "'upload'=>ini_get('upload_max_filesize'), 'post'=>ini_get('post_max_size'), "
+                     "'wp_memory'=>WP_MEMORY_LIMIT, 'wp_max'=>WP_MAX_MEMORY_LIMIT, "
+                     "'upload_error'=>$_FILES['sample']['error'] ?? null]);")
+    probe.chmod(0o644)
+    try:
+        for _ in range(30):
+            status, _, body, code = request(site['primary'], '/wpi-ci-limits.php')
+            values = json.loads(body) if status == 200 and code == 0 else {}
+            if values.get('memory') == '500M' and values.get('upload') == '8M':
+                break
+            time.sleep(0.2)
+        assert values == {'memory': '500M', 'upload': '8M', 'post': '16M',
+                          'wp_memory': '500M', 'wp_max': '500M', 'upload_error': None}, values
+        with tempfile.TemporaryDirectory(prefix='wpi-upload-ci-') as tmp:
+            upload = Path(tmp) / 'sample.bin'
+            for size, expected_status, expected_error in ((1, 200, 0), (9, 200, 1), (17, 413, None)):
+                with upload.open('wb') as output:
+                    output.truncate(size * autotune.MIB)
+                result = subprocess.run(['curl', '--silent', '--insecure', '--noproxy', '*',
+                                         '--max-time', '20', '--resolve',
+                                         f'{site["primary"]}:443:127.0.0.1', '--write-out', '\n%{http_code}',
+                                         '-F', f'sample=@{upload}',
+                                         f'https://{site["primary"]}/wpi-ci-limits.php'],
+                                        capture_output=True, text=True, check=True)
+                body, http = result.stdout.rsplit('\n', 1)
+                assert int(http) == expected_status, (size, http)
+                if expected_error is not None:
+                    assert json.loads(body)['upload_error'] == expected_error, (size, body)
+        manager.autotune_tick()
+        assert manager.php_settings_status()['effective']['memory_mib'] == 500
+        reinstall_with_idle_panel()
+        assert manager.config['php_settings'] == {'memory_limit_mb': 500, 'upload_max_filesize_mb': 8}
+        assert manager.php_settings_status()['effective']['memory_mib'] == 500
+        subprocess.run(['/usr/local/bin/wpi', 'php-settings', '--reset'], check=True,
+                       text=True, capture_output=True)
+        assert manager.config['php_settings'] == {}
+        assert manager.php_settings_status()['manual'] == {}
+        automatic = manager.php_settings_status()['effective']
+        for _ in range(30):
+            status, _, body, code = request(site['primary'], '/wpi-ci-limits.php')
+            values = json.loads(body) if status == 200 and code == 0 else {}
+            if values.get('memory') == f"{automatic['memory_mib']}M" \
+                    and values.get('upload') == f"{automatic['upload_mib']}M" \
+                    and values.get('post') == f"{automatic['post_mib']}M":
+                break
+            time.sleep(0.2)
+        assert values.get('memory') == f"{automatic['memory_mib']}M", values
+        assert values.get('upload') == f"{automatic['upload_mib']}M", values
+        assert values.get('post') == f"{automatic['post_mib']}M", values
+        print('Actual FPM/WordPress 500M, upload 8M, POST/web 16M verified; '
+              'small upload accepted, PHP oversize error, web HTTP 413, '
+              'autotune/upgrade persistence and automatic reset passed.', flush=True)
+    finally:
+        probe.unlink(missing_ok=True)
+
+
 with mock.patch.object(core, 'check_dns', return_value=None), \
      mock.patch.object(WebStack, 'obtain_certificate', local_certificate):
     site, _ = manager.install(old, 'owner@example.com', admin='ciadmin', password='CiWordPressPassword123!')
@@ -366,6 +469,7 @@ with mock.patch.object(core, 'check_dns', return_value=None), \
     assert request(old, autotune.STATUS_PATH)[0] == 403
     verify_redirect(old, old, https=False)
     verify_real_fpm_congestion(site)
+    verify_repair_and_php_settings(site)
 
     # A PHP array option is stored serialized by WordPress. The replacement
     # must retain its structure while changing all canonical URL variants.

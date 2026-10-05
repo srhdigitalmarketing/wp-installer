@@ -278,10 +278,18 @@ def detect_resources(proc_root='/proc', sys_root='/sys', target_pid=None):
 def profile(resources):
     total = resources.get('memory_total', 0)
     if total < GIB:
-        return {'memory_mib': 128, 'upload_mib': 32, 'post_mib': 40, 'opcache_mib': 64}
-    if total < 4 * GIB:
-        return {'memory_mib': 256, 'upload_mib': 64, 'post_mib': 80, 'opcache_mib': 128}
-    return {'memory_mib': 384, 'upload_mib': 128, 'post_mib': 144, 'opcache_mib': 256}
+        limits = {'memory_mib': 128, 'upload_mib': 32, 'post_mib': 40, 'opcache_mib': 64}
+    elif total < 4 * GIB:
+        limits = {'memory_mib': 256, 'upload_mib': 64, 'post_mib': 80, 'opcache_mib': 128}
+    else:
+        limits = {'memory_mib': 384, 'upload_mib': 128, 'post_mib': 144, 'opcache_mib': 256}
+    settings = resources.get('php_settings', {})
+    if settings:
+        # Local import keeps the pure settings policy usable by the service
+        # without creating a module-initialization cycle.
+        from .php_settings import configured_profile
+        limits = configured_profile(limits, settings, resources)
+    return limits
 
 
 def render_ini(resources):
@@ -300,14 +308,14 @@ def render_ini(resources):
             "opcache.validate_timestamps = 1\nopcache.revalidate_freq = 2\n")
 
 
-def render_pool(children, status_socket):
+def render_pool(children, status_socket, resources=None):
     # The controller supplies a RAM/CPU-derived capacity. Preserve it here so
     # larger servers can use their measured resources without an arbitrary cap.
     children = max(1, int(children))
     spare_min = max(1, min(4, children // 4 or 1))
     spare_max = min(children, max(spare_min, min(8, children // 2 or 1)))
     start = min(children, max(spare_min, (spare_min + spare_max) // 2))
-    return ("; WPI automatic controller: overrides Ubuntu's www pool.\n"
+    content = ("; WPI automatic controller: overrides Ubuntu's www pool.\n"
             "[global]\nprocess_control_timeout = 185s\n[www]\n"
             "pm = dynamic\n"
             f"pm.max_children = {children}\npm.start_servers = {start}\n"
@@ -315,6 +323,17 @@ def render_pool(children, status_socket):
             "pm.max_requests = 500\nrequest_terminate_timeout = 180s\n"
             "request_terminate_timeout_track_finished = yes\n"
             f"pm.status_listen = {Path(status_socket).as_posix()}\npm.status_path = {STATUS_PATH}\n")
+    # php_admin_value cannot be overridden by an application's ini_set().
+    # Keep automatic mode's existing behavior; pin only explicit settings.
+    if resources and resources.get('php_settings'):
+        limits = profile(resources)
+        settings = resources['php_settings']
+        if 'memory_limit_mb' in settings:
+            content += f"php_admin_value[memory_limit] = {limits['memory_mib']}M\n"
+        if 'upload_max_filesize_mb' in settings:
+            content += (f"php_admin_value[upload_max_filesize] = {limits['upload_mib']}M\n"
+                        f"php_admin_value[post_max_size] = {limits['post_mib']}M\n")
+    return content
 
 
 def capacity(resources):
@@ -328,7 +347,11 @@ def capacity(resources):
         raw_rss = [raw_rss]
     samples = sorted(x for x in raw_rss if x > 0)
     p90 = samples[min(len(samples) - 1, math.ceil(len(samples) * 0.9) - 1)] if samples else 0
-    worker = max(96 * MIB, math.ceil(p90 * 1.25))
+    explicit = resources.get('php_settings', {}).get('memory_limit_mb')
+    # A manually raised limit authorizes a request to use that much memory.
+    # Budget its peak plus native/extension overhead before adding workers.
+    floor = (int(explicit) + 32) * MIB if explicit else 96 * MIB
+    worker = max(floor, math.ceil(p90 * 1.25))
     memory_cap = max(1, budget // worker)
     cpu_cap = max(1, math.floor(max(0.1, resources.get('cpus', 1)) * 8))
     return {'capacity': min(cpu_cap, memory_cap), 'worker_bytes': worker,
@@ -528,12 +551,14 @@ class AutoTuner:
         if php_version not in ('8.1', '8.3'):
             raise ValueError('Versi PHP autotune tidak didukung.')
         self.php_version, self.runner = php_version, runner
+        self.config_file = Path(data_dir) / 'config.json'
         self.data = Path(data_dir) / 'autotune'
         self.etc, self.proc, self.sys = Path(etc_root), Path(proc_root), Path(sys_root)
         self.runtime = Path(run_root) / 'wpi-autotune'
         self.clock = clock
         self.pool = self.etc / f'php/{php_version}/fpm/pool.d/zz-wpi-autotune.conf'
         self.ini = self.etc / f'php/{php_version}/fpm/conf.d/99-wpi.ini'
+        self.cli_ini = self.etc / f'php/{php_version}/cli/conf.d/99-wpi.ini'
         self.state_file = self.data / 'state.json'
 
     @property
@@ -596,14 +621,23 @@ class AutoTuner:
         pid = _number(self.runtime.parent / f'php/php{self.php_version}-fpm.pid')
         # The monitored service may have different limits from this timer's
         # cgroup. Inspect FPM's master rather than the controller when running.
-        return detect_resources(self.proc, self.sys, target_pid=pid if pid and pid > 0 else None)
+        result = detect_resources(self.proc, self.sys, target_pid=pid if pid and pid > 0 else None)
+        if self.config_file.exists():
+            cfg = json.loads(self.config_file.read_text(encoding='utf-8'))
+            settings = cfg.get('php_settings', {})
+            if settings:
+                from .php_settings import configured_profile
+                configured_profile(profile(result), settings, result)
+                result = {**result, 'php_settings': settings}
+        return result
 
     def _apply(self, children, resources, update_ini=True):
         """Transactionally validate and reload; preserve the working config."""
         self._runtime()
-        changes = {self.pool: render_pool(children, self.status_socket)}
+        changes = {self.pool: render_pool(children, self.status_socket, resources)}
         if update_ini:
             changes[self.ini] = render_ini(resources)
+            changes[self.cli_ini] = render_ini(resources)
         previous = {path: path.read_bytes() if path.exists() else None for path in changes}
         if all(previous[path] == value.encode('utf-8') for path, value in changes.items()):
             return False
@@ -773,7 +807,7 @@ class AutoTuner:
             changed = decision['children'] != state['children']
             if changed and decision['children'] < state['children']:
                 settings = dict(re.findall(r'^(pm\.[a-z_]+) = (\d+)$',
-                                           render_pool(decision['children'], self.status_socket), re.M))
+                                           render_pool(decision['children'], self.status_socket, resources), re.M))
                 startup = int(settings['pm.start_servers']) * decision['worker_bytes']
                 startup += profile(resources)['opcache_mib'] * MIB + 32 * MIB
                 if resources.get('memory_available', 0) < startup:

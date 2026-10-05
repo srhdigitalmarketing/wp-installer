@@ -212,6 +212,8 @@ class TargetMigration:
                 or config.get('database') not in ('mysql', 'mariadb')
                 or not isinstance(sites, list) or not sites):
             raise ValueError('Konfigurasi sumber migrasi tidak valid.')
+        if 'php_settings' in config and not isinstance(config['php_settings'], dict):
+            raise ValueError('Pengaturan PHP sumber migrasi tidak valid.')
         used, identities, allowed = set(), set(), {'metadata.json'}
         for site in sites:
             self._validate_site(site)
@@ -524,12 +526,21 @@ class TargetMigration:
             metadata = self._unpack_bundle(Path(bundle_path), extracted, expected_sha256, migration_id)
             self._preflight_target(metadata, journal)
             self._preflight_space(extracted, metadata, journal)
+            settings = metadata['source_config'].get('php_settings', {})
+            if settings:
+                from .autotune import detect_resources, profile
+                from .php_settings import configured_profile
+                resources = detect_resources()
+                configured_profile(profile(resources), settings, resources, check_capacity=True)
             self.manager.setup(metadata['source_config']['stack'], metadata['source_config']['database'])
             if not journal:
                 journal = {'schema': 1, 'direction': 'target', 'migration_id': migration_id,
                            'sha256': expected_sha256, 'status': 'importing', 'sites': {}, 'ssl': {}}
                 self._save(journal)
             try:
+                if settings and self.manager.config.get('php_settings', {}) != settings:
+                    self.manager.set_php_settings(memory_limit=settings.get('memory_limit_mb', 'auto'),
+                                                  upload_max_filesize=settings.get('upload_max_filesize_mb', 'auto'))
                 for original in metadata['sites']:
                     ident = original['id']
                     progress = journal['sites'].setdefault(ident, {'status': 'importing'})
@@ -562,6 +573,7 @@ class TargetMigration:
                     self.manager.wp(site, 'config', 'set', 'DB_PASSWORD', '--prompt',
                                     input=credentials['database_password'] + '\n')
                     self.manager.runner(['chmod', '640', str(Path(site['root']) / 'wp-config.php')])
+                    self.manager._site_memory_settings(site)
                     backup = self.manager.backups / ident / ('migration-' + migration_id)
                     _safe_directory(backup)
                     if backup.exists():
@@ -581,6 +593,7 @@ class TargetMigration:
                     self._frontend_health(site)
                     site['status'] = 'active'
                     self.manager.save_site(site)
+                    self.manager.remember_config(ident)
                     progress['status'] = 'complete'
                     self._save(journal)
                 if metadata['source_config'].get('phpmyadmin'):

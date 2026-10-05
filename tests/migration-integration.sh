@@ -139,6 +139,7 @@ with mock.patch('wpi.core.check_dns'), mock.patch.object(WebStack, 'obtain_certi
     manager.add_domain(site['id'], HOSTS[1], kind='alias')
     manager.add_domain(site['id'], HOSTS[2], kind='redirect')
 site = manager.site(site['id'])
+manager.set_php_settings(memory_limit=500, upload_max_filesize=128)
 post = manager.wp(site, 'post', 'create', '--post_type=post', '--post_status=publish',
                   '--post_title=Migration preserved article', '--post_name=migration-preserved',
                   '--post_content=Migration preserved content', '--porcelain').stdout.strip()
@@ -427,6 +428,8 @@ stage = sys.argv[1]
 manifest = json.loads(Path('/root/source-manifest.json').read_text())
 original = manifest['site']
 manager = Manager()
+assert manager.config['php_settings'] == {'memory_limit_mb': 500, 'upload_max_filesize_mb': 128}
+assert manager.php_settings_status()['effective']['memory_mib'] == 500
 target = TargetMigration(manager)
 site = manager.site(original['id'])
 report = target.status()['migrations'][0]
@@ -455,6 +458,9 @@ if stage == 'before-dns':
     # in memory and captured WP-CLI output; no assertion or log prints them.
     assert hashlib.sha256(new_password.encode()).hexdigest() != manifest['database_password_hash']
     assert manager.wp(site, 'config', 'get', 'DB_PASSWORD').stdout.strip() == new_password
+    assert manager.wp(site, 'config', 'get', 'WP_MEMORY_LIMIT').stdout.strip() == '500M'
+    assert manager.wp(site, 'config', 'get', 'WP_MAX_MEMORY_LIMIT').stdout.strip() == '500M'
+    assert list((manager.data / 'config-snapshots' / site['id']).glob('*/COMPLETE'))
     imported_backup = manager.backups / site['id'] / ('migration-' + report['migration_id'])
     restored, safety = manager.restore(site['id'], imported_backup)
     site = manager.site(site['id'])

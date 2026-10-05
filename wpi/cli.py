@@ -157,6 +157,61 @@ def migrate_interactive(manager, host=None, username=None, port=22):
     print('Periksa di server baru: sudo wpi migration-status')
 
 
+def show_repair(report):
+    labels = {'healthy': 'Sehat', 'resolved': 'Perbaikan berhasil',
+              'unresolved': 'Belum terselesaikan'}
+    print(f"{report['primary']}: {labels.get(report['status'], report['status'])}")
+    for name, value in report.get('checks', {}).items():
+        if isinstance(value, dict):
+            print(f"  {name}: HTTP {value['status']} ({value['scheme']}); "
+                  + ('OK' if value['ok'] else 'gagal'))
+        else:
+            print(f"  {name}: " + ('OK' if value else 'gagal'))
+    for action in report.get('actions', []):
+        print('  Tindakan: ' + json.dumps(action, ensure_ascii=False))
+    if report.get('preserved_config'):
+        print('Config sebelum repair: ' + str(report['preserved_config']))
+    if report.get('session_reset'):
+        print('Konfigurasi dibuat ulang; silakan login ulang ke WordPress.')
+    if report.get('status') == 'unresolved':
+        print('Diagnosis belum menemukan perbaikan yang berhasil. Periksa error log PHP/web '
+              'dan kompatibilitas plugin/theme. Database dan konten tidak di-restore.')
+    if report.get('errors'):
+        print('Hasil pemeriksaan: ' + ', '.join(report['errors']))
+
+
+def show_php_settings(report):
+    effective = report['effective']
+    manual = report['manual']
+    print('Pengaturan PHP berlaku untuk seluruh situs WPI dan phpMyAdmin (pool bersama).')
+    print(f"Memory: {effective['memory_mib']}M; "
+          f"upload: {effective['upload_mib']}M; POST/web: {effective['post_mib']}M.")
+    print('Memory: ' + ('manual' if 'memory_limit_mb' in manual else 'otomatis')
+          + '; upload: ' + ('manual' if 'upload_max_filesize_mb' in manual else 'otomatis'))
+    print(f"Kapasitas worker menurut resource: {report['capacity']}; "
+          'jumlah proses aktif tetap mengikuti traffic dan resource.')
+    if report.get('backup'):
+        print('Backup pengaturan: ' + str(report['backup']))
+
+
+def php_settings_interactive(manager):
+    report = manager.php_settings_status()
+    show_php_settings(report)
+    mode = ask('1=Ubah limit, 2=Kembali otomatis', '1')
+    if mode == '2':
+        result = run_operation(manager.set_php_settings, reset=True)
+    elif mode == '1':
+        print('Masukkan MB, contoh 500 atau 500M; auto = mengikuti resource server.')
+        manual = report['manual']
+        memory = ask('PHP memory limit', str(manual.get('memory_limit_mb', 'auto')))
+        upload = ask('Maksimum upload file', str(manual.get('upload_max_filesize_mb', 'auto')))
+        result = run_operation(manager.set_php_settings, memory_limit=memory,
+                               upload_max_filesize=upload)
+    else:
+        raise ValueError('Pilihan harus 1 atau 2.')
+    show_php_settings(result)
+
+
 def menu(manager):
     choices = [
         ('1', 'Install WordPress otomatis'), ('2', 'Daftar situs & domain'),
@@ -167,6 +222,7 @@ def menu(manager):
         ('11', 'Update WordPress core'), ('12', 'Status & diagnosis'),
         ('13', 'Lihat kredensial situs'), ('14', 'Lanjutkan instalasi gagal'),
         ('15', 'Migrasi otomatis ke server baru'),
+        ('16', 'Auto repair situs / error 500'), ('17', 'PHP memory limit & upload size'),
         ('0', 'Keluar'),
     ]
     while True:
@@ -229,6 +285,10 @@ def menu(manager):
                 print(f'https://{site["primary"]}/wp-admin/\nUsername: {site["admin"]}\nPassword: {password}')
             elif choice == '15':
                 migrate_interactive(manager)
+            elif choice == '16':
+                show_repair(run_operation(manager.repair_site, select_site(manager)))
+            elif choice == '17':
+                php_settings_interactive(manager)
             else:
                 print('Pilihan tidak dikenal.')
         except (ValueError, RuntimeError, OSError) as error:
@@ -272,6 +332,13 @@ def parser():
     commands.add_parser('autotune-enable', help='Aktivasi otomatis saat upgrade instalasi WPI.')
     commands.add_parser('autotune-tick', help='Perintah internal timer PHP-FPM.')
     commands.add_parser('autotune-status', help='Lihat kapasitas dan keputusan PHP-FPM otomatis.')
+    repair = commands.add_parser('repair', help='Diagnosis dan repair situs yang dipilih.')
+    repair.add_argument('site')
+    repair.add_argument('--check', action='store_true', help='Diagnosis saja, tanpa mengubah server.')
+    settings = commands.add_parser('php-settings', help='Lihat atau ubah memory/upload seluruh situs.')
+    settings.add_argument('--memory-limit', help='MB, 500M, 1G, atau auto.')
+    settings.add_argument('--upload-max-filesize', help='MB, 128M, 1G, atau auto.')
+    settings.add_argument('--reset', action='store_true', help='Kembalikan kedua limit ke otomatis.')
     migration = commands.add_parser('migrate', help='Migrasikan semua situs ke Ubuntu baru lewat SSH.')
     migration.add_argument('--host', help='IP server tujuan.')
     migration.add_argument('--user', dest='username', help='Username SSH tujuan.')
@@ -331,6 +398,23 @@ def main(argv=None):
             print(json.dumps({'outgoing': Migration(manager).status(),
                               'incoming': TargetMigration(manager).status()},
                              ensure_ascii=False, sort_keys=True))
+            return 0
+        if command == 'repair':
+            if args.check:
+                report = manager.repair_site(args.site, check_only=True)
+            else:
+                report = run_operation(manager.repair_site, args.site)
+            show_repair(report)
+            return 1 if report['status'] == 'unresolved' else 0
+        if command == 'php-settings':
+            if args.reset and (args.memory_limit is not None or args.upload_max_filesize is not None):
+                raise ValueError('--reset tidak digabung dengan pengaturan limit.')
+            if args.reset or args.memory_limit is not None or args.upload_max_filesize is not None:
+                report = run_operation(manager.set_php_settings, memory_limit=args.memory_limit,
+                                       upload_max_filesize=args.upload_max_filesize, reset=args.reset)
+            else:
+                report = manager.php_settings_status()
+            show_php_settings(report)
             return 0
         if command == 'menu':
             menu(manager)

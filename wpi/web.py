@@ -55,7 +55,7 @@ class WebStack:
     certificate issuance is deliberately separate from vhost activation.
     """
 
-    def __init__(self, runner: Callable, stack: str, php_version: str):
+    def __init__(self, runner: Callable, stack: str, php_version: str, post_max_size_mb: int = 320):
         if stack not in {"nginx", "apache"}:
             raise ValueError("Stack harus nginx atau apache.")
         if php_version not in {"8.1", "8.3"}:
@@ -63,6 +63,9 @@ class WebStack:
         self.runner = runner
         self.stack = stack
         self.php_version = php_version
+        if type(post_max_size_mb) is not int or not 1 <= post_max_size_mb <= 2047:
+            raise ValueError("Batas request harus positif dan maksimal 2047 MiB.")
+        self.post_max_size_mb = post_max_size_mb
         service = "nginx" if stack == "nginx" else "apache2"
         self.service = service
         self.available = Path(f"/etc/{service}/sites-available")
@@ -119,7 +122,7 @@ class WebStack:
                 "    }\n")
 
     def _nginx_php(self) -> str:
-        return ("    client_max_body_size 320m;\n"
+        return (f"    client_max_body_size {self.post_max_size_mb}m;\n"
                 "    location = /wpi-fpm-status { return 403; }\n"
                 "    location ~ \\.php$ {\n"
                 "        try_files $uri =404;\n"
@@ -178,7 +181,7 @@ class WebStack:
                 "    </Location>\n")
 
     def _apache_php(self) -> str:
-        return ("    LimitRequestBody 335544320\n"
+        return (f"    LimitRequestBody {self.post_max_size_mb * 1024 ** 2}\n"
                 "    ProxyTimeout 180\n"
                 "    <LocationMatch \"^/wpi-fpm-status(?:/|$)\">\n"
                 "        Require all denied\n"
@@ -370,6 +373,59 @@ class WebStack:
         command = ["nginx", "-t"] if self.stack == "nginx" else ["apache2ctl", "configtest"]
         self.runner(command, check=True, capture_output=True, text=True)
         self.runner(["systemctl", "reload", self.service], check=True, capture_output=True, text=True)
+
+    def body_limit_contents(self, sites, phpmyadmin=None):
+        """Return only WPI-owned vhost replacements for a server-wide limit."""
+        changes = {f"wpi-{self._site(site)['id']}.conf": self.render_site(site) for site in sites}
+        if phpmyadmin:
+            host = _domain(phpmyadmin['domain'])
+            changes[self._pma_filename(host)] = self.render_phpmyadmin(
+                host, phpmyadmin.get('root', '/usr/share/phpmyadmin'),
+                phpmyadmin.get('auth_file', '/etc/wpi/pma.htpasswd'))
+        return changes
+
+    def write_body_limits(self, sites, phpmyadmin=None):
+        """Activate all managed body limits together, rolling back as a group."""
+        changes = self.body_limit_contents(sites, phpmyadmin)
+        self.available.mkdir(parents=True, exist_ok=True)
+        self.enabled.mkdir(parents=True, exist_ok=True)
+        previous = {}
+        for name in changes:
+            target, link = self.available / name, self.enabled / name
+            if target.is_symlink():
+                raise RuntimeError('Menolak symlink konfigurasi web.')
+            old = target.read_bytes() if target.exists() else None
+            if old is not None and not old.startswith(HEADER.encode()):
+                raise RuntimeError('Konfigurasi web bukan milik WPI.')
+            old_link = os.readlink(link) if link.is_symlink() else None
+            if os.path.lexists(link) and (old_link is None or not self._link_targets(link, target, old_link)):
+                raise RuntimeError('Sites-enabled berisi konfigurasi bukan milik WPI.')
+            previous[name] = (old, target.stat().st_mode & 0o777 if target.exists() else 0o644, old_link)
+        try:
+            for name, content in changes.items():
+                target, link = self.available / name, self.enabled / name
+                self._atomic_file(target, content.encode('utf-8'))
+                if not os.path.lexists(link):
+                    link.symlink_to(target)
+            if changes:
+                self.validate_reload()
+        except BaseException:
+            for name, (old, mode, old_link) in previous.items():
+                target, link = self.available / name, self.enabled / name
+                if os.path.lexists(link):
+                    link.unlink()
+                if old is None:
+                    target.unlink(missing_ok=True)
+                else:
+                    self._atomic_file(target, old, mode)
+                if old_link is not None:
+                    link.symlink_to(old_link)
+            try:
+                if changes:
+                    self.validate_reload()
+            except Exception:
+                pass
+            raise
 
     @staticmethod
     def _atomic_file(path: Path, content: bytes, mode: int = 0o644) -> None:

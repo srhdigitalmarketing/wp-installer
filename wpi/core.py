@@ -120,7 +120,36 @@ class Manager:
         cfg = self.config
         if not cfg:
             raise ValueError('Jalankan setup atau install WordPress terlebih dahulu.')
-        return WebStack(self.runner, cfg['stack'], cfg['php_version'])
+        from .php_settings import PHPSettings
+        return WebStack(self.runner, cfg['stack'], cfg['php_version'],
+                        post_max_size_mb=PHPSettings(self).effective()['post_mib'])
+
+    def remember_config(self, identifier):
+        from .repair import SiteRepair
+        site = self.site(identifier)
+        if (Path(site['root']) / 'wp-config.php').is_file():
+            return SiteRepair(self).remember_config(identifier)
+
+    def _site_memory_settings(self, site):
+        if self.config.get('php_settings'):
+            from .php_settings import PHPSettings
+            value = f"{PHPSettings(self).effective()['memory_mib']}M"
+            for name in ('WP_MEMORY_LIMIT', 'WP_MAX_MEMORY_LIMIT'):
+                self.wp(site, 'config', 'set', name, value, '--type=constant')
+
+    def repair_site(self, identifier, check_only=False):
+        from .repair import SiteRepair
+        repair = SiteRepair(self)
+        return repair.diagnose(identifier) if check_only else repair.repair(identifier)
+
+    def php_settings_status(self):
+        from .php_settings import PHPSettings
+        return PHPSettings(self).status()
+
+    def set_php_settings(self, memory_limit=None, upload_max_filesize=None, reset=False):
+        from .php_settings import PHPSettings
+        settings = PHPSettings(self)
+        return settings.reset() if reset else settings.apply(memory_limit, upload_max_filesize)
 
     def sites(self):
         return [json.loads(p.read_text()) for p in sorted((self.data / 'sites').glob('*.json'))]
@@ -258,6 +287,13 @@ class Manager:
             web.install_phpmyadmin(pma['domain'], '/usr/share/phpmyadmin', '/etc/wpi/pma.htpasswd')
         cfg['autotune_enabled'] = True
         atomic_json(self.data / 'config.json', cfg)
+        # Upgrade establishes a baseline only for a loadable configuration.
+        # Broken legacy files are left for the user-selected Repair operation.
+        for site in self.sites():
+            try:
+                self.remember_config(site['id'])
+            except (ValueError, RuntimeError, OSError):
+                pass
         return report
 
     def autotune_tick(self):
@@ -313,6 +349,7 @@ class Manager:
             self.runner(['chmod', '640', str(root / 'wp-config.php')])
             self.wp(site, 'config', 'set', 'DISALLOW_FILE_EDIT', 'true', '--raw')
             self.wp(site, 'config', 'set', 'WP_AUTO_UPDATE_CORE', 'minor')
+            self._site_memory_settings(site)
             self.wp(site, 'core', 'install', f'--url=https://{host}', f'--title={title}',
                     f'--admin_user={admin}', f'--admin_email={email}', '--skip-email',
                     '--prompt=admin_password', input=password + '\n')
@@ -327,6 +364,7 @@ class Manager:
             atomic_json(self.data / 'credentials' / (ident + '.json'),
                         {'wordpress_admin': admin, 'wordpress_password': password,
                          'database_user': site['db_user'], 'database_password': dbpass})
+            self.remember_config(ident)
             return site, password
         except BaseException:
             site['status'] = 'incomplete'
@@ -340,6 +378,7 @@ class Manager:
         site = self.site(identifier)
         site['status'] = 'active'
         self.save_site(site)
+        self.remember_config(identifier)
 
     def resume_install(self, identifier):
         site = self.site(identifier)
@@ -377,6 +416,7 @@ class Manager:
                     input=credentials['wordpress_password'] + '\n')
         self.wp(site, 'config', 'set', 'DISALLOW_FILE_EDIT', 'true', '--raw')
         self.wp(site, 'config', 'set', 'WP_AUTO_UPDATE_CORE', 'minor')
+        self._site_memory_settings(site)
         self.wp(site, 'rewrite', 'structure', '/%postname%/')
         self.web.write_site(site)
         self.retry_install_ssl(identifier)
@@ -539,6 +579,7 @@ class Manager:
             self.wp(original, 'maintenance-mode', 'deactivate', check=False)
         if old_domain == 'remove':
             self.delete_certificate(old)
+        self.remember_config(identifier)
         return site, snapshot
 
     def backup(self, identifier):
@@ -687,6 +728,8 @@ class Manager:
             self.wp(current, 'maintenance-mode', 'deactivate', check=False)
             if staged.exists():
                 shutil.rmtree(staged)
+        self._site_memory_settings(old)
+        self.remember_config(identifier)
         return old, safety
 
     def renew_ssl(self, identifier):
@@ -770,6 +813,7 @@ class Manager:
         self.wp(site, 'core', 'update-db')
         self.wp(site, 'core', 'verify-checksums')
         self.wp(site, 'cache', 'flush')
+        self.remember_config(identifier)
         return snapshot
 
     def doctor(self):
