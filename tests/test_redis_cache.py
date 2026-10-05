@@ -91,6 +91,7 @@ class Backend:
         self.instances, self.memory = {}, 32 * GIB
         self.installed_packages = {'redis-server', 'redis-tools', 'php8.3-redis'}
         self.stock_service_exists, self.fail_resize, self.fail_health = False, False, False
+        self.config_name_field = 'name'
 
     def runner(self, argv, **kwargs):
         self.calls.append(list(argv))
@@ -134,13 +135,16 @@ class Backend:
             value = kwargs['input'].strip() if '--prompt' in args else args[3]
             content = path.read_text()
             content = re.sub(r"^define\('" + key + r"',.*?\);\n", '', content, flags=re.M)
-            path.write_text(content + f"define('{key}', {json.dumps(value)});\n")
+            expression = value if '--raw' in args else json.dumps(value)
+            path.write_text(content + f"define('{key}', {expression});\n")
         elif args[:2] == ('config', 'delete'):
             path.write_text(re.sub(r"^define\('" + args[2] + r"',.*?\);\n", '', path.read_text(), flags=re.M))
         elif args[:2] == ('config', 'list'):
             values = re.findall(r"^define\('(WP_REDIS_[A-Z_]+)', (.*)\);$", path.read_text(), re.M)
-            out = json.dumps([{'key': key, 'value': json.loads(value), 'type': 'constant'}
-                              for key, value in values])
+            filtered = [(key, value) for key, value in values if
+                        (key == args[2] if '--strict' in args else args[2] in key)]
+            out = json.dumps([{self.config_name_field: key, 'value': json.loads(value),
+                               'type': 'constant'} for key, value in filtered])
         elif args[:2] == ('plugin', 'install'):
             target = Path(site['root']) / 'wp-content/plugins/redis-cache/includes/object-cache.php'
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -289,6 +293,50 @@ class ActivationTests(unittest.TestCase):
         self.assertFalse(any(entry[1][:2] in (('config', 'set'), ('config', 'delete'))
                              for entry in self.backend.wp_calls))
 
+    def test_config_current_accepts_real_wpcli_name_schema_and_legacy_key_schema(self):
+        self.cache.enable_site(self.a)
+        site = self.manager.site(self.a)
+        for field in ('name', 'key'):
+            with self.subTest(field=field):
+                self.backend.config_name_field = field
+                self.assertTrue(self.cache._config_current(site))
+                output = self.backend.wp(site, 'config', 'list', 'WP_REDIS_', '--format=json')
+                constants = self.cache._config_constants(output.stdout)
+                self.assertIs(constants['WP_REDIS_DISABLED'], False)
+                self.assertIs(constants['WP_REDIS_DISABLE_GROUP_FLUSH'], True)
+                self.assertEqual(constants['WP_REDIS_TIMEOUT'], 0.5)
+
+    def test_noop_rejects_php_strings_and_boolean_numeric_type_confusion(self):
+        self.cache.enable_site(self.a)
+        site = self.manager.site(self.a)
+        config = Path(site['root']) / 'wp-config.php'
+        original = config.read_text()
+        for name, expression, replacement in (
+                ('WP_REDIS_DISABLED', 'false', '"false"'),
+                ('WP_REDIS_DATABASE', '0', '"0"'),
+                ('WP_REDIS_TIMEOUT', '0.5', '"0.5"'),
+                ('WP_REDIS_DISABLED', 'false', '0'),
+                ('WP_REDIS_DATABASE', '0', 'false'),
+                ('WP_REDIS_DISABLE_GROUP_FLUSH', 'true', '1')):
+            with self.subTest(name=name):
+                config.write_text(original.replace(f"define('{name}', {expression});",
+                                                   f"define('{name}', {replacement});"))
+                self.assertFalse(self.cache._config_current(site))
+        config.write_text(original)
+        self.assertTrue(self.cache._config_current(site))
+
+    def test_repeated_prepare_preserves_all_persistent_managed_state(self):
+        self.cache.enable_site(self.a)
+        def state():
+            return {str(path.relative_to(self.base)): path.read_bytes()
+                    for path in self.base.rglob('*') if path.is_file()}
+        before = state()
+        self.backend.wp_calls.clear()
+        self.cache.prepare_site_config(self.a)
+        self.assertEqual(state(), before)
+        self.assertFalse(any(entry[1][:2] in (('config', 'set'), ('config', 'delete'))
+                             for entry in self.backend.wp_calls))
+
     def test_optimize_only_resizes_live_instances_and_never_restarts_stopped_site(self):
         self.cache.enable_site(self.a)
         self.cache.enable_site(self.b)
@@ -391,12 +439,17 @@ class ActivationTests(unittest.TestCase):
         self.assertFalse(target.exists())
         self.assertNotIn(self.a, self.backend.active)
         self.assertFalse(self.manager.site(self.a)['redis_cache']['enabled'])
-        self.assertIn("define('WP_REDIS_DISABLED', \"true\");", (Path(site['root']) / 'wp-config.php').read_text())
+        self.assertIn("define('WP_REDIS_DISABLED', true);", (Path(site['root']) / 'wp-config.php').read_text())
         self.assertFalse(any(call[0] == 'systemctl' for call in self.backend.calls))
         self.assertTrue(all(entry[1][0] == 'config' for entry in self.backend.wp_calls))
         before = (Path(site['root']) / 'wp-config.php').read_bytes()
-        self.assertFalse(self.cache.prepare_disabled_config(self.a)['changed'])
+        backups = list((self.data / 'redis/backups').iterdir())
+        for field in ('name', 'key'):
+            with self.subTest(field=field):
+                self.backend.config_name_field = field
+                self.assertFalse(self.cache.prepare_disabled_config(self.a)['changed'])
         self.assertEqual((Path(site['root']) / 'wp-config.php').read_bytes(), before)
+        self.assertEqual(list((self.data / 'redis/backups').iterdir()), backups)
 
     def test_disabled_restore_refuses_foreign_snapshot_dropin_without_mutation(self):
         site = self.manager.site(self.a)

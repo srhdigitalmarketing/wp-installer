@@ -724,6 +724,15 @@ with mock.patch.object(core, 'check_dns', return_value=None), \
     state_before = persistent_state()
     reinstall_with_idle_panel()
     state_after = persistent_state()
+    if state_after != state_before:
+        before_paths, after_paths = set(state_before), set(state_after)
+        changed = {'added': sorted(after_paths - before_paths),
+                   'removed': sorted(before_paths - after_paths),
+                   'changed': sorted(path for path in before_paths & after_paths
+                                     if state_before[path] != state_after[path])}
+        # Relative names only: never emit bytes, hashes, credentials, SQL, or
+        # config contents from the persistent state snapshots.
+        print('Safe reinstall persistent-state path changes: ' + json.dumps(changed), flush=True)
     assert state_after == state_before, 'Application reinstall changed managed site state or credentials.'
     version = subprocess.run(['/usr/local/bin/wpi', '--version'], check=True, text=True, capture_output=True)
     assert version.stdout.strip() == os.environ['WPI_CI_VERSION']

@@ -199,7 +199,22 @@ class Manager:
         for site in self.sites():
             if site['status'] != 'active' or site.get('redis_cache', {}).get('enabled') is False:
                 continue
-            reports.append(self.redis.enable_site(site['id']))
+            try:
+                reports.append(self.redis.enable_site(site['id']))
+            except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
+                # A site's cache/config conflict must not block a server upgrade
+                # or prevent healthy sites and resource timers from being set up.
+                # Keep exception text private: WP commands may contain secrets.
+                kind = ('ValueError' if isinstance(error, ValueError) else
+                        'OSError' if isinstance(error, OSError) else
+                        'SubprocessError' if isinstance(error, subprocess.SubprocessError) else
+                        'RuntimeError')
+                reason = ('Konfigurasi situs perlu diperiksa; object-cache.php lain tidak ditimpa.'
+                          if kind == 'ValueError' else
+                          'Aktivasi cache situs gagal; periksa layanan Redis dan jalankan diagnosis Repair.')
+                reports.append({'site_id': site['id'],
+                                'enabled': bool(site.get('redis_cache', {}).get('enabled')),
+                                'skipped': True, 'error_type': kind, 'reason': reason})
         return {'server': self.redis.status(), 'sites': reports}
 
     def redis_status(self):

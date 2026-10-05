@@ -448,15 +448,35 @@ class RedisCache:
                                      check=False)
             if result.returncode:
                 return False
-            rows = json.loads(result.stdout)
-            values = {row['key']: row['value'] for row in rows if row.get('type') == 'constant'}
-            normalize = lambda value: str(value).lower() if isinstance(value, bool) else str(value)
+            values = self._config_constants(result.stdout)
             forbidden = ('WP_REDIS_SERVERS', 'WP_REDIS_SHARDS', 'WP_REDIS_CLUSTER',
                          'WP_REDIS_SENTINEL', 'WP_REDIS_MAXTTL', 'WP_REDIS_UNFLUSHABLE_GROUPS')
-            return all(normalize(values.get(key)) == value for key, value in {**strings, **raw}.items()) \
+            expected = {**strings, **{key: json.loads(value) for key, value in raw.items()}}
+            # JSON preserves PHP booleans and numbers. In particular, the string
+            # 'false' is truthy in PHP and must not pass a disabled=false check.
+            return all(type(values.get(key)) is type(value) and values[key] == value
+                       for key, value in expected.items()) \
                 and not any(key in values for key in forbidden)
         except (OSError, ValueError, RuntimeError, KeyError, TypeError):
             return False
+
+    @staticmethod
+    def _config_constants(output):
+        rows = json.loads(output)
+        if not isinstance(rows, list):
+            raise ValueError('Format konfigurasi WP-CLI tidak valid.')
+        values = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError('Format konfigurasi WP-CLI tidak valid.')
+            if row.get('type') != 'constant':
+                continue
+            # Current config-command emits name/value/type; older releases used key.
+            name = row.get('name', row.get('key'))
+            if not isinstance(name, str) or name in values or 'value' not in row:
+                raise ValueError('Konstanta konfigurasi WP-CLI tidak valid.')
+            values[name] = row['value']
+        return values
 
     def _config_set(self, site, candidate, name, value, raw=False, private=False):
         args = ['config', 'set', name]
@@ -550,9 +570,8 @@ class RedisCache:
         disabled = False
         if result.returncode == 0:
             try:
-                rows = json.loads(result.stdout)
-                disabled = any(row.get('key') == 'WP_REDIS_DISABLED' and
-                               str(row.get('value')).lower() == 'true' for row in rows)
+                values = self._config_constants(result.stdout)
+                disabled = values.get('WP_REDIS_DISABLED') is True
             except (ValueError, TypeError):
                 pass
         if current is None and disabled:

@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -87,6 +88,68 @@ class RedisManagerHooksTests(unittest.TestCase):
         self.manager.enable_redis()
         self.cache.install.assert_called_once_with()
         self.cache.enable_site.assert_not_called()
+
+    def _bulk_sites(self):
+        failed = {'id': '111111111111', 'primary': 'conflict.example.com', 'status': 'active'}
+        healthy = {'id': '222222222222', 'primary': 'healthy.example.com', 'status': 'active'}
+        for site in (failed, healthy):
+            self.manager.save_site(site)
+        self.cache.status.return_value = {'enabled': True, 'sites': []}
+        return failed, healthy
+
+    def test_bulk_activation_continues_after_site_failure_without_disclosing_exception(self):
+        failed, healthy = self._bulk_sites()
+        original = {path: path.read_bytes() for path in (self.manager.data / 'sites').glob('*.json')}
+        success = {'site_id': healthy['id'], 'enabled': True, 'changed': False}
+        for error, kind in (
+            (ValueError('foreign drop-in private-password'), 'ValueError'),
+            (RuntimeError('AUTH private-password'), 'RuntimeError'),
+            (PermissionError('private-password'), 'OSError'),
+            (subprocess.CalledProcessError(1, ['redis', 'private-password']), 'SubprocessError'),
+        ):
+            with self.subTest(kind=kind):
+                self.cache.reset_mock()
+                self.cache.enable_site.side_effect = [error, success]
+                result = self.manager.enable_redis()
+                self.assertEqual(self.cache.enable_site.call_args_list,
+                                 [mock.call(failed['id']), mock.call(healthy['id'])])
+                self.assertEqual(result['sites'][0]['error_type'], kind)
+                self.assertTrue(result['sites'][0]['skipped'])
+                self.assertFalse(result['sites'][0]['enabled'])
+                self.assertEqual(result['sites'][1], success)
+                self.assertNotIn('private-password', json.dumps(result))
+                self.assertEqual({path: path.read_bytes() for path in original}, original)
+
+    def test_explicit_site_and_global_install_failures_remain_strict(self):
+        failed, _ = self._bulk_sites()
+        self.cache.enable_site.side_effect = ValueError('foreign drop-in')
+        with self.assertRaises(ValueError):
+            self.manager.enable_redis(failed['id'])
+        self.cache.reset_mock()
+        self.cache.install.side_effect = RuntimeError('global package failure')
+        with self.assertRaises(RuntimeError):
+            self.manager.enable_redis()
+        self.cache.enable_site.assert_not_called()
+
+    def test_optimization_sets_up_php_and_timer_after_a_skipped_site(self):
+        failed, healthy = self._bulk_sites()
+        self.cache.enable_site.side_effect = [ValueError('foreign drop-in'),
+                                             {'site_id': healthy['id'], 'enabled': True}]
+        with mock.patch.object(self.manager, 'enable_autotune', return_value={'enabled': True}) as tune, \
+                mock.patch.object(self.manager, '_install_performance_timer') as timer:
+            result = self.manager.optimize()
+        self.assertTrue(result['redis']['sites'][0]['skipped'])
+        self.assertEqual(result['redis']['sites'][0]['site_id'], failed['id'])
+        self.assertTrue(result['redis']['sites'][1]['enabled'])
+        tune.assert_called_once_with()
+        timer.assert_called_once_with()
+
+    def test_bulk_activation_success_report_is_stable_on_repeat(self):
+        self._bulk_sites()
+        self.cache.enable_site.side_effect = lambda identifier: {
+            'site_id': identifier, 'enabled': True, 'changed': False}
+        first = self.manager.enable_redis()
+        self.assertEqual(self.manager.enable_redis(), first)
 
     def test_tick_only_rebudgets_and_does_not_reenable_cache(self):
         self.manager.performance_tick()

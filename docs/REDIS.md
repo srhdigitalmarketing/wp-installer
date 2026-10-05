@@ -44,9 +44,14 @@ disable disimpan dan dipertahankan oleh `optimize`, upgrade, serta migrasi.
 Aktifkan lagi secara sengaja dengan `redis-enable ID_SITUS`.
 
 WPI memeriksa kepemilikan plugin dan drop-in sebelum perubahan. Situs yang
-memakai object cache lain tidak ditimpa otomatis. Status menampilkan alasan
-situs dilewati atau aktivasi gagal agar pengguna dapat menyelesaikan konflik
-plugin terlebih dahulu.
+memakai object cache lain tidak ditimpa otomatis. Hasil `optimize` atau
+`redis-enable` tanpa ID menampilkan situs yang dilewati/gagal beserta jenis
+error dan alasan umum, lalu melanjutkan situs lain. `optimize` tetap
+menyiapkan PHP-FPM dan timer setelah memproses situs tersebut.
+Pengaturan global dan anggaran RAM tetap harus valid sebelum proses ini.
+Perintah dengan ID tetap melaporkan kegagalan situs tersebut sebagai error.
+Status Redis menampilkan konfigurasi cache dan koneksi saat ini; alasan
+kegagalan aktivasi tidak disimpan sebagai pengaturan situs.
 
 ## Isolasi dan koneksi
 
