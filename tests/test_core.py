@@ -572,7 +572,7 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(self.manager.site(current['id'])['migration_id'], current['migration_id'])
         password_call = next((argv, options) for argv, options in self.commands
                              if 'DB_PASSWORD' in argv)
-        self.assertIn('--prompt=value', password_call[0])
+        self.assertIn('--prompt', password_call[0])
         self.assertNotIn(credential['database_password'], password_call[0])
         self.assertEqual(password_call[1]['input'], credential['database_password'] + '\n')
         database.assert_called_once_with(restored, snapshot.resolve())

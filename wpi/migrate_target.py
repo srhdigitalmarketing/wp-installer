@@ -557,7 +557,9 @@ class TargetMigration:
                     self._extract_public(folder / 'files.tar.gz', site)
                     for key, value in (('DB_NAME', site['db_name']), ('DB_USER', site['db_user']), ('DB_HOST', 'localhost')):
                         self.manager.wp(site, 'config', 'set', key, value)
-                    self.manager.wp(site, 'config', 'set', 'DB_PASSWORD', '--prompt=value',
+                    # <value> is positional: the bare prompt reads it privately
+                    # from stdin; named prompts cover associative WP-CLI flags.
+                    self.manager.wp(site, 'config', 'set', 'DB_PASSWORD', '--prompt',
                                     input=credentials['database_password'] + '\n')
                     self.manager.runner(['chmod', '640', str(Path(site['root']) / 'wp-config.php')])
                     backup = self.manager.backups / ident / ('migration-' + migration_id)

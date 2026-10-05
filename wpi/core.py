@@ -662,7 +662,9 @@ class Manager:
                 for key, value in (('DB_NAME', current['db_name']), ('DB_USER', current['db_user']),
                                    ('DB_HOST', 'localhost')):
                     self.wp(old, 'config', 'set', key, value)
-                self.wp(old, 'config', 'set', 'DB_PASSWORD', '--prompt=value',
+                # WP-CLI named prompts only support options. The missing
+                # positional value must use --prompt; stdin stays private.
+                self.wp(old, 'config', 'set', 'DB_PASSWORD', '--prompt',
                         input=restore_credentials['database_password'] + '\n')
                 self.runner(['chmod', '640', str(root / 'wp-config.php')])
             self.restore_database(old, folder)

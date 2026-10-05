@@ -244,6 +244,16 @@ with SSHSession(target, 'root', password) as session:
         'cat /var/lib/wpi/migrations/' + failed['migration_id'] + '.json').stdout)
     assert imported['status'] == 'incomplete'
     assert len(imported['sites']) == 1
+    if any(value['status'] != 'complete' for value in imported['sites'].values()):
+        stage = {'status': imported['status'], 'sites': [
+            {key: value.get(key) for key in ('status', 'database_claimed', 'database_provisioned')}
+            for value in imported['sites'].values()]}
+        print('Unexpected import progress (safe flags only): ' + json.dumps(stage), flush=True)
+        trace = session.run_root("python3 -c \"import json; from pathlib import Path; "
+                                 "p=Path('/root/wpi-ci-command-trace.jsonl'); "
+                                 "print(json.dumps([json.loads(s) for s in p.read_text().splitlines()[-24:]] "
+                                 "if p.exists() else []))\"")
+        print('Target command categories and exit codes only: ' + trace.stdout.strip(), flush=True)
     assert all(value['status'] == 'complete' for value in imported['sites'].values())
     session.run_root("[ \"$(head -n 1 /etc/systemd/system/wpi-migration-ssl.service)\" = '# Unmanaged CI fixture' ]\n"
                      "rm -f -- /etc/systemd/system/wpi-migration-ssl.service")
@@ -261,6 +271,70 @@ print('Real encrypted SSH password login, password sudo, bootstrap, and migratio
 print('Interrupted final activation resumed through non-root SSH using the same snapshot, database, migration ID, and bundle checksum.', flush=True)
 PY
 docker cp "$WPI_CI_WORK/migrate-fixture.py" "$WPI_CI_SOURCE:/root/migrate-fixture.py"
+
+# Before the controlled SSL interruption, track only safe command categories
+# and return codes from the real target processes. Patching subprocess.run
+# covers existing default runner bindings without changing their behavior.
+cat > "$WPI_CI_WORK/import-diagnostic.py" <<'PY'
+import json
+import os
+from pathlib import Path
+import subprocess
+
+original_run = subprocess.run
+groups = {'core', 'config', 'db', 'user', 'post', 'maintenance-mode', 'rewrite', 'cache', 'search-replace'}
+verbs = {'download', 'verify-checksums', 'is-installed', 'create', 'set', 'get', 'export', 'import',
+         'tables', 'activate', 'deactivate', 'is-active', 'flush', 'structure'}
+programs = {'mysql', 'openssl', 'curl', 'nginx', 'apache2ctl', 'systemctl', 'apt-get', 'runuser'}
+def category(argv):
+    if not isinstance(argv, (list, tuple)) or not argv or not isinstance(argv[0], str):
+        return None
+    program = Path(argv[0]).name
+    if program not in programs:
+        return None
+    label = program
+    if program == 'runuser':
+        # WP-CLI arguments follow its one fixed --path option. Include only
+        # known verbs and DB constant names, never positional values or flags.
+        paths = [index for index, value in enumerate(argv) if isinstance(value, str) and value.startswith('--path=')]
+        if not paths:
+            return None
+        tail = argv[paths[0] + 1:]
+        while tail and tail[0] in {'--skip-plugins', '--skip-themes'}:
+            tail = tail[1:]
+        if tail and tail[0] in groups:
+            label = 'wp.' + tail[0]
+            if len(tail) > 1 and tail[1] in verbs:
+                label += '.' + tail[1]
+            if len(tail) > 2 and tail[0] == 'config' and tail[2] in {'DB_NAME', 'DB_USER', 'DB_HOST', 'DB_PASSWORD'}:
+                label += '.' + tail[2]
+    return program, label
+def record(argv, code):
+    tag = category(argv)
+    if tag:
+        value = json.dumps({'program': tag[0], 'category': tag[1], 'returncode': code}) + '\n'
+        try:
+            fd = os.open('/root/wpi-ci-command-trace.jsonl', os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                os.write(fd, value.encode())
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+def traced_run(argv, **kwargs):
+    try:
+        result = original_run(argv, **kwargs)
+    except subprocess.CalledProcessError as exc:
+        record(argv, exc.returncode)
+        raise
+    except subprocess.TimeoutExpired:
+        record(argv, 'timeout')
+        raise
+    record(argv, result.returncode)
+    return result
+subprocess.run = traced_run
+PY
+docker cp "$WPI_CI_WORK/import-diagnostic.py" "$WPI_CI_TARGET:/usr/lib/python3/dist-packages/sitecustomize.py"
 docker exec "$WPI_CI_SOURCE" python3 -u /root/migrate-fixture.py "$WPI_CI_SOURCE_IP" "$WPI_CI_TARGET_IP"
 docker cp "$WPI_CI_SOURCE:/root/source-manifest.json" "$WPI_CI_WORK/source-manifest.json"
 docker cp "$WPI_CI_WORK/source-manifest.json" "$WPI_CI_TARGET:/root/source-manifest.json"

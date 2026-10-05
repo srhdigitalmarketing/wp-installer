@@ -141,7 +141,7 @@ class TargetImportTests(unittest.TestCase):
         self.assertNotEqual(credentials['database_password'], 'original-db-password')
         self.assertEqual(len(credentials['database_password']), 48)
         password_call = next(call for call in self.manager.wp.call_args_list if 'DB_PASSWORD' in call.args)
-        self.assertIn('--prompt=value', password_call.args)
+        self.assertIn('--prompt', password_call.args)
         self.assertNotIn(credentials['database_password'], password_call.args)
         self.assertEqual(password_call.kwargs['input'], credentials['database_password'] + '\n')
         self.manager.restore_database.assert_called_once()
