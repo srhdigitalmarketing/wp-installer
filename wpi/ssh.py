@@ -113,12 +113,14 @@ class SSHSession:
             else:
                 message = f'Perintah {Path(argv[0]).name} gagal (exit {result.returncode}); detail sensitif tidak ditampilkan.'
             raise RuntimeError(message) from None
-        # Remote commands can produce output for the migration protocol. Avoid
-        # returning a password accidentally echoed by a remote login wrapper.
-        for attr in ('stdout', 'stderr'):
-            value = getattr(result, attr, None)
-            if isinstance(value, str) and self._password:
-                setattr(result, attr, value.replace(self._password, '[redacted]'))
+        # Successful stdout is an internal protocol, never printed here. A
+        # valid short password (e.g. "a" or "ready") can also occur in a marker
+        # or JSON value, so replacing substrings would corrupt that protocol.
+        # Failure messages above never include output. Stderr is diagnostic,
+        # and can safely have an accidentally echoed password removed.
+        value = getattr(result, 'stderr', None)
+        if isinstance(value, str) and self._password:
+            result.stderr = value.replace(self._password, '[redacted]')
         return result
 
     def _install_clients(self):
@@ -206,7 +208,10 @@ class SSHSession:
                 write_fd = None
                 command = ['sshpass', '-d', str(read_fd), 'ssh', '-F', '/dev/null',
                            '-p', str(self.port), *self._options(master=True),
-                           '-M', '-f', '-N', f'{self.username}@{self.host}']
+                           '-f', '-N', f'{self.username}@{self.host}']
+                # ControlMaster=yes is already explicit. Adding -M after it
+                # toggles OpenSSH to "ask", which rejects unattended slave
+                # session requests even though the master alive check passes.
                 self._master_attempted = True
                 self._execute(command, timeout=90, pass_fds=(read_fd,), input='')
             finally:

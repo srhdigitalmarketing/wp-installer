@@ -1,7 +1,9 @@
 """Transport boundaries: anonymous credentials, pinned hosts, and safe cleanup."""
 import os
+import json
 from pathlib import Path
 import shlex
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -9,6 +11,8 @@ import unittest
 from unittest import mock
 
 from wpi.ssh import SSHSession, remote_path, validate_target
+
+SSH_CLIENT = shutil.which('ssh')
 
 
 class TargetTests(unittest.TestCase):
@@ -93,6 +97,23 @@ class SSHSessionTests(unittest.TestCase):
         self.assertIn('-f', master)
         self.assertIn('ControlMaster=yes', master)
         self.assertEqual(self.calls[1][0][-3:], ['-O', 'check', 'root@192.0.2.1'])
+
+    @unittest.skipUnless(SSH_CLIENT, 'OpenSSH is needed for its read-only configuration parser.')
+    def test_real_openssh_master_flags_enable_unattended_sessions(self):
+        # An alive check also succeeds in ControlMaster=ask mode, but opening
+        # a real command then fails without an interactive permission prompt.
+        # Parse the actual generated master arguments using OpenSSH -G: this
+        # detects option interactions without connecting to a server or using
+        # an authentication credential.
+        with self.session():
+            master = next(argv for argv, _ in self.calls if argv[0] == 'sshpass')
+            args = [SSH_CLIENT, '-G', *master[master.index('ssh') + 1:]]
+            # The native Windows client names its empty file NUL. All master
+            # flags remain identical to those supplied to OpenSSH on Ubuntu.
+            args[args.index('-F') + 1] = os.devnull
+            parsed = subprocess.run(args, capture_output=True, text=True, timeout=10)
+            self.assertEqual(parsed.returncode, 0, parsed.stderr)
+            self.assertIn('controlmaster true', parsed.stdout.splitlines())
 
     def test_first_key_is_pinned_and_global_config_or_agent_cannot_override(self):
         with self.session() as session:
@@ -244,13 +265,23 @@ class SSHSessionTests(unittest.TestCase):
         self.assertNotIn(self.password, str(exc.exception))
         self.assertFalse(session.control_path.parent.exists())
 
-    def test_remote_output_has_accidentally_echoed_login_password_redacted(self):
-        with self.session() as session:
-            self.response = lambda argv, kwargs: subprocess.CompletedProcess(
-                argv, 0, stdout='ok ' + self.password, stderr=self.password)
-            result = session.run_root('printf ok')
-            self.assertEqual(result.stdout, 'ok [redacted]')
-            self.assertEqual(result.stderr, '[redacted]')
+    def test_short_password_cannot_corrupt_successful_internal_migration_protocol(self):
+        marker = 'WPI_MIGRATION_PREFLIGHT_OK\n'
+        report = {'migration_id': 'abcdef' * 5 + 'ab', 'status': 'ready',
+                  'sites': [{'primary': 'main.example.com', 'status': 'complete'}]}
+        protocol = marker + json.dumps(report) + '\n'
+        for password in ('a', 'ready', '0', 'WPI_MIGRATION_PREFLIGHT_OK'):
+            with self.subTest(password=password):
+                self.password = password
+                self.response = None
+                with self.session() as session:
+                    self.response = lambda argv, kwargs: subprocess.CompletedProcess(
+                        argv, 0, stdout=protocol, stderr=self.password)
+                    result = session.run_root('printf internal-protocol')
+                    self.assertEqual(result.stdout, protocol)
+                    self.assertIn('WPI_MIGRATION_PREFLIGHT_OK', result.stdout.splitlines())
+                    self.assertEqual(json.loads(result.stdout.splitlines()[-1]), report)
+                    self.assertEqual(result.stderr, '[redacted]')
 
     def test_commands_require_a_connected_session(self):
         session = self.session()
