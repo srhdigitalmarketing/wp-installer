@@ -334,7 +334,27 @@ def traced_run(argv, **kwargs):
     return result
 subprocess.run = traced_run
 PY
-docker cp "$WPI_CI_WORK/import-diagnostic.py" "$WPI_CI_TARGET:/usr/lib/python3/dist-packages/sitecustomize.py"
+install_target_python_hook() {
+    docker cp "$1" "$WPI_CI_TARGET:/root/wpi-ci-sitecustomize.py"
+    docker exec --interactive "$WPI_CI_TARGET" python3 - <<'PY'
+from pathlib import Path
+import py_compile
+import sitecustomize
+# Ubuntu ships a stdlib sitecustomize before dist-packages on sys.path.
+# Replace the module that this disposable target actually imports, rather
+# than writing a shadowed module and silently losing the fixture hook.
+module = Path(sitecustomize.__file__).resolve(strict=True)
+assert module.name == 'sitecustomize.py'
+assert Path('/usr/lib') in module.parents or Path('/etc') in module.parents
+print('Disposable Python hook installed at actual startup module: ' + str(module), flush=True)
+module.write_bytes(Path('/root/wpi-ci-sitecustomize.py').read_bytes())
+module.chmod(0o644)
+py_compile.compile(str(module), doraise=True)
+PY
+}
+install_target_python_hook "$WPI_CI_WORK/import-diagnostic.py"
+docker exec "$WPI_CI_TARGET" python3 -c \
+    'import subprocess; assert subprocess.run.__module__ == "sitecustomize"; print("Disposable import diagnostics startup hook verified.")'
 docker exec "$WPI_CI_SOURCE" python3 -u /root/migrate-fixture.py "$WPI_CI_SOURCE_IP" "$WPI_CI_TARGET_IP"
 docker cp "$WPI_CI_SOURCE:/root/source-manifest.json" "$WPI_CI_WORK/source-manifest.json"
 docker cp "$WPI_CI_WORK/source-manifest.json" "$WPI_CI_TARGET:/root/source-manifest.json"
@@ -360,7 +380,9 @@ def fixture_check(host):
         return original_check(host)
 core.check_dns = fixture_check
 PY
-docker cp "$WPI_CI_WORK/sitecustomize.py" "$WPI_CI_TARGET:/usr/lib/python3/dist-packages/sitecustomize.py"
+install_target_python_hook "$WPI_CI_WORK/sitecustomize.py"
+docker exec "$WPI_CI_TARGET" python3 -c \
+    'from wpi import core; assert core.check_dns.__module__ == "sitecustomize"; print("Disposable private-DNS eligibility startup hook verified.")'
 
 cat > "$WPI_CI_WORK/certbot-fixture.py" <<'PY'
 #!/usr/bin/env python3
