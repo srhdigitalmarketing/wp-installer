@@ -38,10 +38,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     mkdir -p /etc/ssh/sshd_config.d && \
     printf 'PasswordAuthentication yes\nPermitRootLogin yes\nUsePAM yes\n' \
       > /etc/ssh/sshd_config.d/00-wpi-migration-ci.conf && \
-    systemctl enable ssh && rm -f /etc/ssh/ssh_host_* /etc/machine-id && touch /etc/machine-id && \
+    systemctl enable ssh && \
+    rm -f /etc/ssh/ssh_host_* /etc/machine-id /var/lib/dbus/machine-id && \
+    ln -s /etc/machine-id /var/lib/dbus/machine-id && \
     rm -rf /var/lib/apt/lists/*
 STOPSIGNAL SIGRTMIN+3
-CMD ["/bin/bash", "-c", "ssh-keygen -A >/dev/null && mount -o remount,rw /sys/fs/cgroup && exec /sbin/init"]
+CMD ["/bin/bash", "-c", "dbus-uuidgen --ensure=/etc/machine-id && ssh-keygen -A >/dev/null && mount -o remount,rw /sys/fs/cgroup && exec /sbin/init"]
 DOCKERFILE
 docker build --tag "$WPI_CI_IMAGE" "$WPI_CI_WORK"
 for WPI_CI_CONTAINER in "$WPI_CI_SOURCE" "$WPI_CI_TARGET"; do
@@ -61,6 +63,18 @@ for WPI_CI_CONTAINER in "$WPI_CI_SOURCE" "$WPI_CI_TARGET"; do
         sleep 1
     done
 done
+
+# Apt can bake /var/lib/dbus/machine-id into a shared image. Remove that ID
+# above and generate each server's identity before systemd starts, preserving
+# the real product guard against migrating onto the source server itself.
+WPI_CI_SOURCE_ID="$(docker exec "$WPI_CI_SOURCE" cat /etc/machine-id)"
+WPI_CI_TARGET_ID="$(docker exec "$WPI_CI_TARGET" cat /etc/machine-id)"
+[[ "$WPI_CI_SOURCE_ID" =~ ^[a-f0-9]{32}$ && "$WPI_CI_TARGET_ID" =~ ^[a-f0-9]{32}$ \
+    && "$WPI_CI_SOURCE_ID" != "$WPI_CI_TARGET_ID" ]] || {
+    printf 'Disposable servers need distinct valid machine IDs.\n' >&2
+    exit 1
+}
+printf 'Two isolated servers have distinct machine identities.\n'
 
 WPI_CI_SOURCE_IP="$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$WPI_CI_SOURCE")"
 WPI_CI_TARGET_IP="$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$WPI_CI_TARGET")"
@@ -201,6 +215,9 @@ except RuntimeError as exc:
     assert password not in str(exc)
 print('Real root password SSH login and encrypted upload passed.', flush=True)
 print('First target host key pinned; changed host key rejected before password login.', flush=True)
+with SSHSession(target, 'migrator', password) as session:
+    assert session.run_root('id -u').stdout.strip() == '0'
+print('Real non-root password SSH login and password sudo passed.', flush=True)
 try:
     migrator.migrate(source, 'migrator', password)
 except (RuntimeError, ValueError) as exc:
@@ -219,12 +236,14 @@ failed = [value for value in migrator.status() if value['host'] == target and va
 assert len(failed) == 1
 failed = failed[0]
 bundle = migrator.manager.backups / 'migrations' / failed['migration_id'] / 'migration.zip'
-assert bundle.is_file() and migrator.manager.file_hash(bundle) == failed['sha256']
+assert bundle.is_file() and migrator.manager.file_hash(bundle) == failed.get('sha256'), \
+    'Migration failed before the controlled final SSL interruption; no verified source snapshot.'
 snapshots = set(migrator.manager.backups.glob('*/*/COMPLETE'))
 with SSHSession(target, 'root', password) as session:
     imported = json.loads(session.run_root(
         'cat /var/lib/wpi/migrations/' + failed['migration_id'] + '.json').stdout)
     assert imported['status'] == 'incomplete'
+    assert len(imported['sites']) == 1
     assert all(value['status'] == 'complete' for value in imported['sites'].values())
     session.run_root("[ \"$(head -n 1 /etc/systemd/system/wpi-migration-ssl.service)\" = '# Unmanaged CI fixture' ]\n"
                      "rm -f -- /etc/systemd/system/wpi-migration-ssl.service")
