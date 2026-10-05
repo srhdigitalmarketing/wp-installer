@@ -225,6 +225,7 @@ class ActivationTests(unittest.TestCase):
         self.assertIn('+flushdb', acl)
         self.assertNotIn('+flushall', acl)
         self.assertNotIn('+eval', acl)
+        self.assertNotIn('+quit', acl)  # QUIT is not an ACL command in Redis 6.0.
         password_calls = [entry for entry in self.backend.wp_calls if entry[1][:3] ==
                           ('config', 'set', 'WP_REDIS_PASSWORD')]
         self.assertTrue(password_calls)

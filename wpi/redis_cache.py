@@ -303,7 +303,9 @@ class RedisCache:
         commands = ('+get +set +setex +psetex +mget +mset +del +unlink +exists '
                     '+incrby +decrby +expire +pexpire +ttl +pttl +type +scan '
                     '+ping +info +dbsize +flushdb +multi +exec +discard +watch '
-                    '+unwatch +auth +quit +select +echo')
+                    '+unwatch +auth +select +echo')
+        # Redis 6.0 handles QUIT outside its command table; granting +quit
+        # makes ACL loading fail even though closing a connection works.
         # Redis ACL files accept user declarations only, including no comments.
         acl = (ACL_HEADER + 'user default off\n'
                f'user wpi_admin on #{digest(admin["password"])} ~* +@all\n'
