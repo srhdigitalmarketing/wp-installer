@@ -33,6 +33,10 @@ panduan terbaru di bawah; perilakunya berbeda dari rekaman lama.
   Basic Auth tambahan. Hapus phpMyAdmin hanya melepas antarmuka web tersebut;
   **database dan situs WordPress tetap ada**.
 - Backup/restore situs, pemeriksaan layanan, dan pengelolaan SSL melalui menu.
+- **Migrasi otomatis ke server baru**: masukkan IP, username SSH, dan password
+  yang disembunyikan saat diketik. WPI menyiapkan Ubuntu tujuan, menyalin semua
+  situs beserta database/domain/phpMyAdmin, dan mengaktifkan auto-SSL. Setelah
+  selesai, arahkan DNS A/AAAA ke IP server baru. [Panduan migrasi](docs/MIGRATION.md).
 
 WordPress diunduh dari ZIP resmi dan diverifikasi checksum sebelum pemasangan.
 ZIP menghindari masalah nama file panjang pada ekstraksi tar WordPress 7.
@@ -74,12 +78,12 @@ sudo apt-get update
 sudo apt-get install -y curl ca-certificates
 
 curl -fL --proto '=https' --proto-redir '=https' \
-  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.3.0/install.sh \
+  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.4.0/install.sh \
   -o install.sh
 curl -fL --proto '=https' --proto-redir '=https' \
-  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.3.0/install.sh.sha256 \
+  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.4.0/install.sh.sha256 \
   -o install.sh.sha256
-sha256sum --check install.sh.sha256 && sudo bash install.sh --version v1.3.0
+sha256sum --check install.sh.sha256 && sudo bash install.sh --version v1.4.0
 
 sudo wpi
 ```
@@ -92,25 +96,25 @@ percaya atau tinjau kode pada tag versi tersebut.
 
 ### Memakai bundle lokal
 
-Unduh `wp-installer-v1.3.0.zip` dan `wp-installer-v1.3.0.zip.sha256`
-dari [release v1.3.0](https://github.com/srhdigitalmarketing/wp-installer/releases/tag/v1.3.0),
+Unduh `wp-installer-v1.4.0.zip` dan `wp-installer-v1.4.0.zip.sha256`
+dari [release v1.4.0](https://github.com/srhdigitalmarketing/wp-installer/releases/tag/v1.4.0),
 lalu salin ke server bersama `install.sh`.
 
 ```bash
-sudo bash install.sh --bundle ./wp-installer-v1.3.0.zip
+sudo bash install.sh --bundle ./wp-installer-v1.4.0.zip
 sudo wpi
 ```
 
 Hash yang diperoleh secara terpisah juga dapat diberikan melalui `--sha256`:
 
 ```bash
-sudo bash install.sh --bundle ./wp-installer-v1.3.0.zip --sha256 HASH_SHA256_RILIS
+sudo bash install.sh --bundle ./wp-installer-v1.4.0.zip --sha256 HASH_SHA256_RILIS
 ```
 
 Validasi bundle tanpa pemasangan, tanpa akses root, dan tanpa jaringan:
 
 ```bash
-bash install.sh --bundle ./wp-installer-v1.3.0.zip --check-only
+bash install.sh --bundle ./wp-installer-v1.4.0.zip --check-only
 ```
 
 Mode ini memerlukan Bash dan Python 3.10+. SHA256, keamanan path ZIP, kelengkapan
@@ -134,7 +138,7 @@ kredensial yang ditampilkan setelah pemasangan di pengelola password.
 | 9 | Restore backup | 10 | SSL / perbaiki SSL |
 | 11 | Update WordPress core | 12 | Status dan diagnosis |
 | 13 | Lihat kredensial situs | 14 | Lanjutkan instalasi gagal |
-| 0 | Keluar | | |
+| 15 | Migrasi otomatis ke server baru | 0 | Keluar |
 
 Setiap situs mempunyai satu **Primary**. Pada menu **3 — Add domain**, pilih
 situs, masukkan domain baru, lalu pilih **Alias** atau **Redirect**. Alias adalah
@@ -202,6 +206,14 @@ sudo wpi ssl example.net
 sudo wpi update example.net
 sudo wpi status
 sudo wpi lock-status
+
+# Jalankan di server lama. Password diminta di terminal, bukan sebagai argumen.
+sudo wpi migrate --host 203.0.113.10 --user root
+# Untuk SSH tujuan pada port selain 22:
+sudo wpi migrate --host 203.0.113.10 --user ubuntu --port 2222
+
+# Jalankan di server baru untuk melihat status migrasi dan SSL.
+sudo wpi migration-status
 ```
 
 Pada `set-primary`, `--old-domain alias` adalah pilihan standar. Gunakan
@@ -228,6 +240,41 @@ DNS dan port 80 diperbaiki.
 Pilih **menu 13** untuk melihat username/password WordPress dan database
 situs. Kredensial ini tampil hanya pada terminal root; simpan secara pribadi.
 
+## Migrasi ke server baru
+
+Jalankan **menu 15** di server lama, masukkan IP server baru, username SSH, dan
+password. WPI memindahkan seluruh situs yang dikelolanya. Server tujuan harus
+berupa Ubuntu 22.04/24.04 dengan systemd yang bersih atau instalasi WPI kosong.
+Gunakan akun root atau akun sudo yang memakai password login SSH yang sama.
+Stack web/database mengikuti server sumber; PHP/FPM dihitung ulang dari
+resource server tujuan. WPI memasang kebutuhan SSH yang belum tersedia pada
+server sumber secara otomatis.
+
+Migrasi mempertahankan akun WordPress, tema/plugin, media, database, Primary,
+Alias, Redirect, dan akses phpMyAdmin. Password akun database di server baru
+dibuat ulang dan diterapkan pada `wp-config.php` serta kredensial WPI. Password
+SSH hanya dipakai selama sesi; tidak disimpan dalam file, argumen, atau
+environment. Kunci host server baru dipin pada koneksi pertama dan perubahan
+kunci pada koneksi berikutnya ditolak.
+
+Setelah laporan **server tujuan siap**, ubah DNS A/AAAA semua domain, termasuk
+www, Alias, Redirect, serta phpMyAdmin, ke IP server baru. Sertifikat sumber
+yang masih valid beserta private key ditransfer melalui SSH terenkripsi untuk
+mempertahankan HTTPS selama pergantian. Timer di server baru memeriksa rute
+HTTP domain sekitar setiap lima menit, kemudian menerbitkan sertifikat Let's
+Encrypt baru dan menyiapkan pembaruannya. Tidak perlu menjalankan konfigurasi
+SSL secara manual; DNS dan akses port 80/443 harus mencapai server tujuan.
+
+Server sumber tetap tersedia. WordPress memasuki maintenance saat snapshot
+file/database dibuat, kemudian aktif kembali. Perubahan setelah snapshot
+tidak ikut disalin: jadwalkan saat sepi dan hentikan penulisan post/order sampai
+pergantian selesai bila situs sering menerima data baru. Migrasi bukan sinkronisasi
+berkelanjutan. Backup sumber disimpan untuk pemulihan; migrasi yang terputus
+dapat diulang ke server yang sama untuk melanjutkan snapshot tersebut.
+
+Lihat [panduan migrasi dan auto-SSL](docs/MIGRATION.md) untuk status, batas cakupan,
+dan penanganan DNS/SSL yang masih menunggu.
+
 ## Data dan backup
 
 | Lokasi | Isi |
@@ -238,7 +285,11 @@ situs. Kredensial ini tampil hanya pada terminal root; simpan secara pribadi.
 | `/var/lib/wpi/` | Metadata stack, situs, domain, dan operasi WPI. |
 | `/var/lib/wpi/credentials/` | Kredensial pemulihan situs; hanya root. |
 | `/var/lib/wpi/autotune/` | Status dan keputusan terakhir controller PHP/FPM; hanya root. |
+| `/var/lib/wpi/ssh/known_hosts` | Pin kunci host SSH tujuan; hanya root. |
+| `/var/lib/wpi/migrations-out/` | Journal migrasi pada server sumber; tanpa password SSH. |
+| `/var/lib/wpi/migrations/` | Journal impor dan auto-SSL pada server tujuan; hanya root. |
 | `/var/backups/wpi/` | Backup situs dan database. |
+| `/var/backups/wpi/migrations/` | Snapshot migrasi lengkap dan privat pada server sumber. |
 | `/var/log/wpi/` | Direktori yang disiapkan; output SQL/kredensial tidak direkam. |
 
 Metadata dan backup hanya dapat dibaca root. Password database WordPress
@@ -250,12 +301,12 @@ Menjalankan bootstrap lagi mengganti aplikasi secara atomik dan mempertahankan
 data situs serta backup. Paket server dan konten WordPress dikelola terpisah
 dari pembaruan aplikasi WPI. Untuk memperbarui instalasi versi sebelumnya,
 tutup menu lama yang sedang menunggu pilihan dengan **0**, lalu jalankan ulang
-perintah instalasi v1.3.0 di atas. Tunggu operasi yang sedang berjalan selesai
+perintah instalasi v1.4.0 di atas. Tunggu operasi yang sedang berjalan selesai
 sebelum menutup panel. Pada stack WPI yang sudah
 selesai disiapkan, bootstrap otomatis mengaktifkan pengelolaan PHP/FPM tanpa
 menginstal ulang WordPress atau meminta pengaturan tambahan.
 
-Upgrade ke v1.3.0 mempertahankan domain dan data yang sudah terpasang. Domain
+Upgrade ke v1.4.0 mempertahankan domain dan data yang sudah terpasang. Domain
 secondary versi sebelumnya tetap menjadi Redirect 301; domain tersebut tidak
 otomatis diubah menjadi Alias. Add domain baru memakai Alias secara standar.
 
@@ -264,7 +315,7 @@ otomatis diubah menjadi Alias. Add domain baru memakai Alias secara standar.
 Versi hingga v1.2.0 mengunci seluruh sesi panel, termasuk saat menunggu pilihan.
 Pesan `Panel WPI lain sedang berjalan. Tutup panel tersebut dahulu.` dapat
 muncul ketika panel lama masih terbuka di terminal atau sesi SSH lain. Tutup
-panel tersebut dengan **0** saat sudah kembali ke menu, lalu pasang v1.3.0.
+panel tersebut dengan **0** saat sudah kembali ke menu, lalu pasang v1.4.0.
 
 Mulai v1.2.1, menu, prompt, `sudo wpi list`, dan `sudo wpi status` tidak menahan
 kunci operasi. Beberapa panel dapat dibuka bersamaan; operasi yang mengubah

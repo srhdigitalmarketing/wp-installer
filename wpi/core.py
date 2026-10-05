@@ -456,10 +456,11 @@ class Manager:
             return
         if host == self.config.get('phpmyadmin', {}).get('domain'):
             return
-        if self.web.certificate_ready(host):
+        if self.web.certificate_ready(host) and self.web.letsencrypt_ready(host):
             result = self.runner(['certbot', 'delete', '--cert-name', host, '--non-interactive'], check=False)
             if result.returncode:
                 print('Domain dilepas; sertifikat lama belum dapat dibersihkan. Periksa certbot certificates.')
+        self.web.remove_migrated_certificate(host)
 
     def replacement_pairs(self, old, new):
         # Boundaries protect similarly named hosts; serialized and JSON escaped URLs both supported.
@@ -601,6 +602,20 @@ class Manager:
         old = json.loads((folder / 'site.json').read_text())
         if old['root'] != current['root'] or old['id'] != current['id']:
             raise ValueError('Lokasi/identitas backup tidak cocok.')
+        restore_credentials = None
+        if current.get('migration_id'):
+            # Imported snapshots retain the source's wp-config and manifest.
+            # The destination has a new SQL password; restore must keep it and
+            # the destination's pending ACME ownership while restoring content.
+            credential_path = self.data / 'credentials' / (current['id'] + '.json')
+            if credential_path.is_symlink():
+                raise ValueError('Kredensial database target tidak boleh symlink.')
+            restore_credentials = json.loads(credential_path.read_text())
+            if (restore_credentials.get('database_user') != current['db_user']
+                    or not re.fullmatch(r'[a-f0-9]{48}', str(restore_credentials.get('database_password', '')))
+                    or (old['db_name'], old['db_user']) != (current['db_name'], current['db_user'])):
+                raise ValueError('Kredensial/identitas database target tidak cocok dengan backup migrasi.')
+            old['migration_id'] = current['migration_id']
         for host in site_hosts(old):
             self.ensure_free_domain(host, allow_site=current['id'])
         root = Path(current['root'])
@@ -641,6 +656,13 @@ class Manager:
             root.rename(displaced)
             (staged / 'public').rename(root)
             self.runner(['chown', '-R', 'www-data:www-data', str(root)])
+            if restore_credentials:
+                for key, value in (('DB_NAME', current['db_name']), ('DB_USER', current['db_user']),
+                                   ('DB_HOST', 'localhost')):
+                    self.wp(old, 'config', 'set', key, value)
+                self.wp(old, 'config', 'set', 'DB_PASSWORD', '--prompt=value',
+                        input=restore_credentials['database_password'] + '\n')
+                self.runner(['chmod', '640', str(root / 'wp-config.php')])
             self.restore_database(old, folder)
             old['tls'] = [h for h in site_hosts(old) if self.web.certificate_ready(h)]
             self.web.write_site(old)

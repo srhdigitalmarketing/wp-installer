@@ -58,6 +58,32 @@ berkelanjutan. Penurunan batas resource harus tetap mengurangi target kapasitas.
 Angka tersebut adalah tes kebijakan dengan resource buatan, bukan pengujian
 512 proses produksi sungguhan.
 
+Untuk migrasi v1.4.0, tes source/target menggunakan paket backup buatan serta
+runner SSH/server palsu. Periksa checksum paket dan manifest per berkas,
+penolakan traversal ZIP/tar, symlink, hostname/ID/database tidak valid, dan
+konflik dengan situs/database tujuan. Pemindahan mempertahankan akun WordPress,
+media, peran Primary/Alias/Redirect, serta pemisahan penghapusan UI phpMyAdmin
+dari database. Password database baru harus diterapkan pada `wp-config.php`
+dan kredensial tujuan. Journal harus melanjutkan snapshot yang sama sesudah
+kegagalan tanpa menimpa situs yang tidak dimiliki migrasi tersebut.
+
+Tes transport memeriksa bahwa password diteruskan melalui anonymous FD ke
+`sshpass`, descriptor ditutup setelah login, dan password tidak masuk argv,
+environment, file, atau pesan error. Kunci host dipin pada koneksi awal dan
+kunci yang berubah ditolak. Socket master privat harus dibersihkan pada akhir
+context atau kegagalan; slave tidak boleh memakai koneksi TCP cadangan apabila
+master hilang. Pada POSIX, jalankan tes framing stdin menggunakan shell nyata
+dan executable sudo fixture tanpa elevasi untuk memastikan satu baris password
+dikonsumsi dan script dikutip dengan benar. Tes POSIX tersebut dilewati pada
+Windows; pembentukan argumen dan framing tetap diperiksa di kedua sistem.
+
+Tes auto-SSL migrasi harus membuktikan domain yang masih menuju sumber tidak
+memicu Certbot. Hanya respons HTTP yang cocok dengan token acak server tujuan
+boleh memulai penerbitan. DNS yang belum siap menunggu siklus lima menit, kegagalan
+ACME memakai jeda satu jam, dan jeda disimpan sebelum pengajuan agar proses
+terputus tidak terus mengajukan sertifikat. Domain yang sudah dihapus atau
+dipindahkan ke situs lain tidak boleh diaktifkan ulang oleh journal lama.
+
 ## Integrasi Ubuntu sekali pakai
 
 `tests/integration.sh` hanya boleh dijalankan di VM CI sekali pakai. Skrip ini
@@ -105,6 +131,41 @@ diperiksa menggunakan sertifikat self-signed sementara. DNS publik dan penerbita
 sertifikat ACME sengaja tidak dipanggil; hasil tes integrasi ini tidak membuktikan
 sertifikat Let's Encrypt dapat diterbitkan untuk domain produksi.
 
+## Integrasi migrasi dua server sekali pakai
+
+`tests/migration-integration.sh` menyediakan fixture dua container Ubuntu 24.04
+dengan systemd, OpenSSH, sudo, Nginx, MariaDB, PHP-FPM, dan WordPress nyata.
+Skrip ini memasang layanan, membuat akun/password sementara, mengubah resolver,
+dan menghapus container serta image fixture setelah selesai. Jalankan hanya
+pada runner Docker sekali pakai dengan `CI=true` dan `WPI_DISPOSABLE_VM=1`:
+
+```bash
+env CI=true WPI_DISPOSABLE_VM=1 bash tests/migration-integration.sh
+```
+
+Fixture memeriksa login SSH password sebagai root dan akun non-root, upload
+terenkripsi, sudo dengan password, bootstrap target, serta transfer database
+dan file. Akun administrator, isi post, hash media, tabel, peran Alias/Redirect,
+dan konfigurasi PHP/FPM target diperiksa melalui layanan yang benar-benar
+berjalan. Situs sumber dan backup harus tetap tersedia dan maintenance telah
+dinonaktifkan setelah snapshot.
+
+Sebelum simulasi DNS berpindah, target memakai pasangan sertifikat sumber yang
+ditransfer; HTTPS Primary/Alias dan Redirect 301 diperiksa. Controller terpasang
+harus melihat token challenge menuju sumber lalu menghasilkan `waiting_dns`
+tanpa mengajukan sertifikat. Setelah resolver fixture diarahkan ke target,
+service/timer systemd yang terpasang memanggil controller untuk memeriksa token
+HTTP nyata, mengganti sertifikat, dan mengaktifkan konfigurasi TLS baru.
+
+Tes ini memakai hostname contoh, IP privat, dan sertifikat self-signed sementara.
+Pemeriksaan kelayakan DNS publik dan executable Certbot diganti fixture hanya
+di container CI; interval timer juga dipercepat pada fixture. Jalur SSH, sudo,
+database, web server, routing challenge, serta controller tetap nyata. Hasil
+uji tidak membuktikan penerbitan Let's Encrypt publik, propagasi DNS internet,
+migrasi Apache/MySQL dua server, atau kapasitas beban produksi. Laporkan hasil
+run CI yang selesai sebagai bukti; keberadaan skrip ini sendiri bukan bukti
+bahwa pengujiannya telah lulus.
+
 ## Penerimaan di Ubuntu dengan domain nyata
 
 Sebelum pemakaian produksi, uji pada Ubuntu bersih dengan domain/subdomain yang
@@ -131,6 +192,12 @@ perubahan domain.
 | Batas resource | Pada VM/container dengan batas RAM/CPU, target kapasitas mengikuti batas yang dihitung; tekanan memori menurunkan kapasitas jika reload aman dan CPU penuh menahan kenaikan. Headroom resource diperiksa sebelum penerapan konfigurasi. WordPress tetap dapat diakses setelah reload selesai. |
 | Upgrade resource VPS | Tambahkan RAM/CPU pada VM uji, reboot jika penyedia memerlukannya, lalu periksa resource efektif yang terlihat di Ubuntu dan status controller. Batas kapasitas dihitung ulang, dapat melewati 128 bila perhitungan mengizinkan, dan bertambah bertahap ketika beban membutuhkan. Penambahan resource sendiri tidak langsung menjalankan seluruh kapasitas worker. |
 | Pemulihan FPM | Simulasikan kegagalan validasi/reload di VM uji; konfigurasi sebelumnya dipulihkan, kegagalan tercatat tanpa kredensial, dan controller mencoba lagi pada siklus berikutnya. |
+| Migrasi server | Dari Ubuntu sumber ke Ubuntu tujuan bersih, masukkan hanya IP, username, password tersembunyi, lalu konfirmasi. Periksa semua situs, akun administrator, file/media, tabel, peran domain, konfigurasi web, serta password database tujuan yang baru. Sumber dan backup tetap tersedia. |
+| HTTPS saat migrasi | Pasangan sertifikat sumber yang masih valid dipasang melalui SSH terenkripsi. HTTPS pada IP tujuan melalui hostname domain tetap dapat dibuka; hostname/key/expiry diperiksa dan sertifikat tidak valid tidak dipasang. |
+| Auto-SSL sesudah DNS | A/AAAA seluruh hostname diarahkan ke target; timer aktif, token HTTP berasal dari target, sertifikat baru diterbitkan dan dipercaya browser, lalu konfigurasi serta timer pembaruan Certbot tersedia pada target. Periksa hostname Primary/Alias/Redirect/phpMyAdmin. |
+| Menunggu DNS / kegagalan SSL | Saat DNS masih menuju sumber, status `waiting_dns` tanpa pengajuan ACME. Jika Certbot gagal, status `retry` dan jeda satu jam. Ulangi pemeriksaan setelah perbaikan DNS/firewall tanpa mengisi konfigurasi SSL manual. |
+| Migrasi terputus | Putuskan transfer di VM uji lalu jalankan ulang dengan IP/username/port yang sama. Snapshot/checksum dan journal dilanjutkan; situs sumber tidak hilang dan situs target lain tidak tertimpa. Perubahan sesudah snapshot tetap tidak tersalin. |
+| Akses SSH migrasi | Login root dan non-root sudo diperiksa. Password tidak tampil pada daftar proses/log/error, pin host tersimpan privat, dan perubahan kunci host ditolak tanpa fallback pemeriksaan longgar. |
 
 Catat versi Ubuntu, stack, output pemeriksaan konfigurasi, status HTTP, dan hasil
 tes. Jangan memasukkan password, dump database, atau data pelanggan ke laporan.

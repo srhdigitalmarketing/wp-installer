@@ -2,11 +2,11 @@
 
 Video publik yang sudah diunggah adalah rekaman **v1.0.0**, dengan alur domain
 lama: secondary selalu Redirect 301 dan pergantian primary melepas domain lama.
-Video tersebut belum memperlihatkan Alias atau Set as Primary pada v1.3.0 dan
+Video tersebut belum memperlihatkan Alias, Set as Primary, atau migrasi server dan
 tidak diregenerasi dalam rilis ini. Transkrip historis di bawah dipertahankan
 untuk menjelaskan rekaman yang tersedia.
 
-## Diagram menu v1.3.0
+## Diagram menu v1.4.0
 
 Diagram berikut menunjukkan menu terbaru; ini bukan transkrip video lama:
 
@@ -14,6 +14,7 @@ Diagram berikut menunjukkan menu terbaru; ini bukan transkrip video lama:
 (3) Add domain        -> Alias (standar) atau Redirect 301; www opsional
 (4) Set as Primary    -> Pilih Alias; backup dan replace URL; primary lama Alias
 (5) Delete domain     -> Lepas hostname Alias/Redirect; situs dan database tetap
+(15) Migrasi server   -> IP, username, password SSH; salin situs; auto-SSL setelah DNS
 ```
 
 Satu situs mempunyai satu Primary. Untuk menjadikan domain baru sebagai primary,
@@ -91,7 +92,7 @@ Kalimat sukses bootstrap yang memang terdapat dalam `install.sh`:
 ### Adegan 3 — menu asli pada rekaman v1.0.0
 
 Cuplikan berikut adalah menu historis sebelum stack dikonfigurasi; menu terbaru
-untuk nomor 3, 4, dan 5 ditunjukkan pada diagram v1.3.0 di atas:
+untuk nomor 3, 4, dan 5 ditunjukkan pada diagram v1.4.0 di atas:
 
 ```text
 WPI — WordPress Installer  v1.0.0
@@ -241,5 +242,5 @@ DEMO SIMULASI — pemasangan server & SSL tidak dijalankan dalam video
 ```
 
 Sumber transkrip historis: `README.md`, `wpi/cli.py`, `wpi/core.py`, dan
-`install.sh` pada rilis v1.0.0. Diagram terbaru mengikuti menu v1.3.0. Overlay
+`install.sh` pada rilis v1.0.0. Diagram terbaru mengikuti menu v1.4.0. Overlay
 penjelasan dibedakan dari keluaran terminal asli.

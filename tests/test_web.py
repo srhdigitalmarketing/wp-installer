@@ -22,6 +22,19 @@ class WebRenderTests(unittest.TestCase):
     def stack(self, stack="nginx"):
         return WebStack(Mock(), stack, "8.3")
 
+    def test_migrated_certificate_cleanup_removes_only_selected_hostname_pair(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            web = self.stack()
+            web.migration_tls = Path(temporary)
+            for host in ('example.com', 'other.example.com'):
+                folder = web.migration_tls / host
+                folder.mkdir()
+                (folder / 'fullchain.pem').write_text('certificate')
+                (folder / 'privkey.pem').write_text('private')
+            web.remove_migrated_certificate('example.com')
+            self.assertFalse((web.migration_tls / 'example.com').exists())
+            self.assertTrue((web.migration_tls / 'other.example.com' / 'privkey.pem').is_file())
+
     def test_fpm_status_endpoint_is_private_for_wordpress_and_phpmyadmin(self):
         for name in ('nginx', 'apache'):
             web = self.stack(name)
@@ -74,6 +87,41 @@ class WebRenderTests(unittest.TestCase):
         site = {**SITE, "tls": ["outside.example.com"]}
         with self.assertRaises(ValueError):
             self.stack().render_site(site)
+
+    def test_migration_certificate_fallback_keeps_https_and_prefers_certbot_lineage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            for stack in ('nginx', 'apache'):
+                web = self.stack(stack)
+                web.live = Path(temporary) / stack / 'live'
+                web.migration_tls = Path(temporary) / stack / 'migration'
+                fallback = web.migration_tls / 'example.com'
+                fallback.mkdir(parents=True)
+                for name in ('fullchain.pem', 'privkey.pem'):
+                    (fallback / name).write_text('migrated certificate')
+                self.assertTrue(web.certificate_ready('example.com'))
+                self.assertFalse(web.letsencrypt_ready('example.com'))
+                site = {**SITE, 'secondary': [], 'tls': ['example.com']}
+                rendered = web.render_site(site)
+                self.assertIn((fallback / 'fullchain.pem').as_posix(), rendered)
+                live = web.live / 'example.com'
+                live.mkdir(parents=True)
+                for name in ('fullchain.pem', 'privkey.pem'):
+                    (live / name).write_text('new certificate')
+                self.assertTrue(web.letsencrypt_ready('example.com'))
+                self.assertEqual(web.certificate_paths('example.com'), (live / 'fullchain.pem', live / 'privkey.pem'))
+                self.assertNotIn((fallback / 'fullchain.pem').as_posix(), web.render_site(site))
+
+    def test_migration_certificate_requires_both_regular_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            web = self.stack()
+            web.live = Path(temporary) / 'live'
+            web.migration_tls = Path(temporary) / 'migration'
+            fallback = web.migration_tls / 'example.com'
+            fallback.mkdir(parents=True)
+            (fallback / 'fullchain.pem').write_text('certificate')
+            self.assertFalse(web.certificate_ready('example.com'))
+            (fallback / 'privkey.pem').write_text('key')
+            self.assertTrue(web.certificate_ready('example.com'))
 
     def test_alias_serves_wordpress_without_primary_redirect(self):
         site = {**SITE, "aliases": ["alias.example.com"]}

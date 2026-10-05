@@ -86,3 +86,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: Disposable runner integration
         run: sudo env CI=true WPI_DISPOSABLE_VM=1 bash tests/integration.sh "${{ matrix.stack }}"
+
+  migration:
+    name: Ubuntu migration / SSH / nginx / MariaDB
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Migration integration syntax
+        run: bash -n tests/migration-integration.sh
+      - name: Two isolated disposable servers
+        run: env CI=true WPI_DISPOSABLE_VM=1 bash tests/migration-integration.sh

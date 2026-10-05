@@ -68,6 +68,9 @@ class WebStack:
         self.available = Path(f"/etc/{service}/sites-available")
         self.enabled = Path(f"/etc/{service}/sites-enabled")
         self.live = Path("/etc/letsencrypt/live")
+        # A migrated certificate keeps HTTPS available during DNS cutover.
+        # Certbot owns live/ and renewal state; imported keys stay separate.
+        self.migration_tls = Path("/etc/wpi/migration-tls")
         self.hook_dir = Path("/etc/letsencrypt/renewal-hooks/deploy")
 
     @property
@@ -95,14 +98,16 @@ class WebStack:
                 "root": _path(site["root"], ("/var/www/wpi",)), "tls": tls}
 
     def _ssl_nginx(self, domain: str) -> str:
-        return (f"    ssl_certificate /etc/letsencrypt/live/{domain}/fullchain.pem;\n"
-                f"    ssl_certificate_key /etc/letsencrypt/live/{domain}/privkey.pem;\n"
+        certificate, key = self.certificate_paths(domain)
+        return (f"    ssl_certificate {certificate.as_posix()};\n"
+                f"    ssl_certificate_key {key.as_posix()};\n"
                 "    ssl_protocols TLSv1.2 TLSv1.3;\n")
 
     def _ssl_apache(self, domain: str) -> str:
+        certificate, key = self.certificate_paths(domain)
         return ("    SSLEngine on\n"
-                f"    SSLCertificateFile /etc/letsencrypt/live/{domain}/fullchain.pem\n"
-                f"    SSLCertificateKeyFile /etc/letsencrypt/live/{domain}/privkey.pem\n"
+                f"    SSLCertificateFile {certificate.as_posix()}\n"
+                f"    SSLCertificateKeyFile {key.as_posix()}\n"
                 "    SSLProtocol -all +TLSv1.2 +TLSv1.3\n")
 
     def _nginx_acme(self, root: str) -> str:
@@ -435,7 +440,36 @@ class WebStack:
 
     def certificate_ready(self, domain: str) -> bool:
         domain = _domain(domain)
+        return self.letsencrypt_ready(domain) or self.migrated_certificate_ready(domain)
+
+    def letsencrypt_ready(self, domain: str) -> bool:
+        domain = _domain(domain)
         return all((self.live / domain / name).is_file() for name in ("fullchain.pem", "privkey.pem"))
+
+    def migrated_certificate_ready(self, domain: str) -> bool:
+        domain = _domain(domain)
+        directory = self.migration_tls / domain
+        return (not directory.is_symlink() and all(
+            (directory / name).is_file() and not (directory / name).is_symlink()
+            for name in ("fullchain.pem", "privkey.pem")))
+
+    def certificate_paths(self, domain: str) -> tuple[Path, Path]:
+        domain = _domain(domain)
+        base = self.live if self.letsencrypt_ready(domain) or not self.migrated_certificate_ready(domain) else self.migration_tls
+        return base / domain / "fullchain.pem", base / domain / "privkey.pem"
+
+    def remove_migrated_certificate(self, domain: str) -> None:
+        domain = _domain(domain)
+        directory = self.migration_tls / domain
+        if self.migration_tls.is_symlink() or directory.is_symlink():
+            raise ValueError("Direktori sertifikat migrasi tidak boleh symlink.")
+        for name in ("fullchain.pem", "privkey.pem"):
+            path = directory / name
+            if path.is_symlink():
+                raise ValueError("Sertifikat migrasi tidak boleh symlink.")
+            path.unlink(missing_ok=True)
+        if directory.is_dir() and not any(directory.iterdir()):
+            directory.rmdir()
 
     def obtain_certificate(self, domain: str, email: str, webroot: str) -> None:
         domain = _domain(domain)
@@ -457,7 +491,7 @@ class WebStack:
                      "--cert-name", domain, "--domain", domain, "--email", email,
                      "--agree-tos", "--non-interactive", "--keep-until-expiring"],
                     check=True, capture_output=True, text=True)
-        if not self.certificate_ready(domain):
+        if not self.letsencrypt_ready(domain):
             raise RuntimeError("Certbot selesai tetapi berkas sertifikat belum tersedia.")
 
     def render_phpmyadmin(self, domain: str, root: str, auth_file: str) -> str:

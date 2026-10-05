@@ -10,6 +10,8 @@ import sys
 from . import __version__
 from .core import Manager, DATA
 from .locking import operation_lock_status, lock_busy_message
+from .migrate import Migration
+from .migrate_target import TargetMigration
 
 
 def ask(label, default=None):
@@ -137,6 +139,24 @@ def set_primary_interactive(manager):
     print(f'Primary: {site["primary"]}\nBackup: {backup}')
 
 
+def migrate_interactive(manager, host=None, username=None, port=22):
+    sites = show_sites(manager)
+    if not sites:
+        raise ValueError('Install WordPress terlebih dahulu sebelum migrasi.')
+    host = host or ask('IP server baru')
+    username = username or ask('Username SSH server baru', 'root')
+    password = getpass.getpass('Password SSH server baru (tidak disimpan): ')
+    if not password:
+        raise ValueError('Password SSH wajib diisi di terminal.')
+    confirm(f'Migrasi {len(sites)} situs ke {host}. Snapshot dibuat saat WordPress dalam maintenance. '
+            'Server sumber dipertahankan; perubahan setelah snapshot tidak disinkronkan.', 'MIGRASI')
+    report = run_operation(Migration(manager).migrate, host, username, password, port=port)
+    print(f'\nServer tujuan siap: {report["host"]}\nBackup sumber: {report["backup"]}')
+    print('Arahkan DNS A/AAAA domain berikut ke server baru: ' + ', '.join(report['domains']))
+    print('Auto-SSL berjalan di server baru dan menerbitkan sertifikat setelah domain mencapainya.')
+    print('Periksa di server baru: sudo wpi migration-status')
+
+
 def menu(manager):
     choices = [
         ('1', 'Install WordPress otomatis'), ('2', 'Daftar situs & domain'),
@@ -146,6 +166,7 @@ def menu(manager):
         ('9', 'Restore backup'), ('10', 'SSL / perbaiki instalasi SSL'),
         ('11', 'Update WordPress core'), ('12', 'Status & diagnosis'),
         ('13', 'Lihat kredensial situs'), ('14', 'Lanjutkan instalasi gagal'),
+        ('15', 'Migrasi otomatis ke server baru'),
         ('0', 'Keluar'),
     ]
     while True:
@@ -206,6 +227,8 @@ def menu(manager):
             elif choice == '14':
                 site, password = run_operation(manager.resume_install, select_site(manager))
                 print(f'https://{site["primary"]}/wp-admin/\nUsername: {site["admin"]}\nPassword: {password}')
+            elif choice == '15':
+                migrate_interactive(manager)
             else:
                 print('Pilihan tidak dikenal.')
         except (ValueError, RuntimeError, OSError) as error:
@@ -249,6 +272,16 @@ def parser():
     commands.add_parser('autotune-enable', help='Aktivasi otomatis saat upgrade instalasi WPI.')
     commands.add_parser('autotune-tick', help='Perintah internal timer PHP-FPM.')
     commands.add_parser('autotune-status', help='Lihat kapasitas dan keputusan PHP-FPM otomatis.')
+    migration = commands.add_parser('migrate', help='Migrasikan semua situs ke Ubuntu baru lewat SSH.')
+    migration.add_argument('--host', help='IP server tujuan.')
+    migration.add_argument('--user', dest='username', help='Username SSH tujuan.')
+    migration.add_argument('--port', type=int, default=22, help='Port SSH (default 22).')
+    commands.add_parser('migration-status', help='Lihat migrasi dan penerbitan SSL otomatis.')
+    commands.add_parser('migration-ssl-tick', help='Perintah internal auto-SSL server tujuan.')
+    migration_import = commands.add_parser('migration-import', help='Perintah internal impor snapshot SSH.')
+    migration_import.add_argument('bundle')
+    migration_import.add_argument('--sha256', required=True)
+    migration_import.add_argument('--migration-id', required=True)
     setup = commands.add_parser('setup')
     setup.add_argument('--stack', choices=['nginx', 'apache'], default='nginx')
     setup.add_argument('--database', choices=['mariadb', 'mysql'], default='mariadb')
@@ -294,12 +327,26 @@ def main(argv=None):
         if command == 'autotune-status':
             print(json.dumps(manager.autotune_status(), ensure_ascii=False, sort_keys=True))
             return 0
+        if command == 'migration-status':
+            print(json.dumps({'outgoing': Migration(manager).status(),
+                              'incoming': TargetMigration(manager).status()},
+                             ensure_ascii=False, sort_keys=True))
+            return 0
         if command == 'menu':
             menu(manager)
         elif command == 'setup':
             run_operation(manager.setup, args.stack, args.database)
         elif command == 'autotune-enable':
             print(json.dumps(run_operation(manager.enable_autotune), ensure_ascii=False, sort_keys=True))
+        elif command == 'migrate':
+            migrate_interactive(manager, args.host, args.username, args.port)
+        elif command == 'migration-import':
+            print(json.dumps(run_operation(TargetMigration(manager).import_bundle,
+                                           args.bundle, args.sha256, args.migration_id),
+                             ensure_ascii=False, sort_keys=True))
+        elif command == 'migration-ssl-tick':
+            print(json.dumps(run_operation(TargetMigration(manager).ssl_tick),
+                             ensure_ascii=False, sort_keys=True))
         elif command == 'list':
             show_sites(manager)
         elif command == 'status':

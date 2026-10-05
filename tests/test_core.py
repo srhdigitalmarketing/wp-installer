@@ -474,6 +474,14 @@ class ManagerTests(unittest.TestCase):
         self.web.certificate_ready.return_value = True
         self.manager.delete_certificate('alias.example.com')
         self.assertEqual(self.commands, [])
+        self.web.remove_migrated_certificate.assert_not_called()
+
+    def test_retired_migration_fallback_does_not_delete_unknown_certbot_lineage(self):
+        self.web.certificate_ready.return_value = True
+        self.web.letsencrypt_ready.return_value = False
+        self.manager.delete_certificate('retired.example.com')
+        self.assertEqual(self.commands, [])
+        self.web.remove_migrated_certificate.assert_called_once_with('retired.example.com')
 
     def test_ssl_renewal_includes_alias_and_redirect_domains(self):
         self.site['aliases'] = ['alias.example.com']
@@ -544,6 +552,41 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual((root / "index.php").read_text(), "old-content")
         self.assertEqual(json.loads((safety / "site.json").read_text())["primary"], current["primary"])
         database.assert_called_once_with(restored, snapshot.resolve())
+
+    def test_restore_imported_snapshot_keeps_destination_sql_password_and_acme_identity(self):
+        root = Path(self.site['root'])
+        root.mkdir(parents=True)
+        (root / 'wp-config.php').write_text('source-db-config')
+        (root / 'index.php').write_text('snapshot-content')
+        snapshot = self.manager.backup(self.site['id'])
+        current = {**self.site, 'migration_id': 'd' * 32}
+        self.manager.save_site(current)
+        credential = {'database_user': current['db_user'], 'database_password': 'a' * 48}
+        core.atomic_json(self.manager.data / 'credentials' / (current['id'] + '.json'), credential)
+        (root / 'index.php').write_text('current-content')
+        self.web.certificate_ready.return_value = True
+        with mock.patch.object(self.manager, 'restore_database') as database:
+            restored, _ = self.manager.restore(current['id'], snapshot)
+        self.assertEqual(restored['migration_id'], current['migration_id'])
+        self.assertEqual((root / 'index.php').read_text(), 'snapshot-content')
+        self.assertEqual(self.manager.site(current['id'])['migration_id'], current['migration_id'])
+        password_call = next((argv, options) for argv, options in self.commands
+                             if 'DB_PASSWORD' in argv)
+        self.assertIn('--prompt=value', password_call[0])
+        self.assertNotIn(credential['database_password'], password_call[0])
+        self.assertEqual(password_call[1]['input'], credential['database_password'] + '\n')
+        database.assert_called_once_with(restored, snapshot.resolve())
+
+    def test_restore_migration_refuses_missing_credentials_before_file_swap(self):
+        root = Path(self.site['root'])
+        root.mkdir(parents=True)
+        (root / 'index.php').write_text('snapshot-content')
+        snapshot = self.manager.backup(self.site['id'])
+        self.manager.save_site({**self.site, 'migration_id': 'd' * 32})
+        (root / 'index.php').write_text('current-content')
+        with self.assertRaises(FileNotFoundError):
+            self.manager.restore(self.site['id'], snapshot)
+        self.assertEqual((root / 'index.php').read_text(), 'current-content')
 
     def test_restore_certificate_failure_does_not_replace_files_or_database(self):
         root = Path(self.site["root"])
