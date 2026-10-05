@@ -139,7 +139,7 @@ manifest = {'site': site, 'post': post,
                 (manager.data / 'credentials' / (site['id'] + '.json')).read_text()
             )['database_password'].encode()).hexdigest(),
             'admin_hash': manager.wp(site, 'user', 'get', 'migration_admin', '--field=user_pass').stdout.strip(),
-            'tables': manager.wp(site, 'db', 'tables', '--format=json').stdout.strip(),
+            'tables': manager.wp(site, 'db', 'tables', '--all-tables-with-prefix').stdout.strip(),
             'ssl_hashes': {host: hashlib.sha256((manager.web.live / host / 'fullchain.pem').read_bytes()).hexdigest()
                            for host in HOSTS}}
 Path('/root/source-manifest.json').write_text(json.dumps(manifest))
@@ -312,7 +312,7 @@ for name in ('id', 'primary', 'aliases', 'secondary', 'admin', 'title', 'db_name
     assert site[name] == original[name], name
 assert manager.wp(site, 'option', 'get', 'home').stdout.strip() == 'https://' + site['primary']
 assert manager.wp(site, 'user', 'get', 'migration_admin', '--field=user_pass').stdout.strip() == manifest['admin_hash']
-assert manager.wp(site, 'db', 'tables', '--format=json').stdout.strip() == manifest['tables']
+assert manager.wp(site, 'db', 'tables', '--all-tables-with-prefix').stdout.strip() == manifest['tables']
 upload = Path(site['root']) / 'wp-content/uploads/migration-fixture.bin'
 assert hashlib.sha256(upload.read_bytes()).hexdigest() == manifest['upload_sha256']
 assert manager.wp(site, 'post', 'get', manifest['post'], '--field=post_content').stdout.strip() == 'Migration preserved content'
@@ -341,7 +341,7 @@ if stage == 'before-dns':
     preserved = json.loads((manager.data / 'credentials' / (site['id'] + '.json')).read_text())
     assert preserved['database_password'] == new_password
     assert manager.wp(site, 'config', 'get', 'DB_PASSWORD').stdout.strip() == new_password
-    assert manager.wp(site, 'db', 'tables', '--format=json').stdout.strip() == manifest['tables']
+    assert manager.wp(site, 'db', 'tables', '--all-tables-with-prefix').stdout.strip() == manifest['tables']
     assert manager.wp(site, 'user', 'get', 'migration_admin', '--field=user_pass').stdout.strip() == manifest['admin_hash']
     assert manager.wp(site, 'post', 'get', manifest['post'], '--field=post_content').stdout.strip() == 'Migration preserved content'
     assert hashlib.sha256(upload.read_bytes()).hexdigest() == manifest['upload_sha256']
