@@ -398,6 +398,19 @@ class TargetImportTests(unittest.TestCase):
                         '-out', str(source / 'privkey.pem')], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertFalse(self.target._install_certificate('primary.example.com', source))
 
+    def test_checkhost_zero_exit_mismatch_output_is_rejected_without_copying_keys(self):
+        source = self.root / 'certs'
+        source.mkdir()
+        (source / 'fullchain.pem').write_text('certificate for another hostname')
+        (source / 'privkey.pem').write_text('private key')
+        command = Mock(return_value=subprocess.CompletedProcess(
+            ['openssl'], 0, 'Hostname primary.example.com does NOT match certificate\n', ''))
+        self.manager.runner = command
+        self.assertFalse(self.target._install_certificate('primary.example.com', source))
+        self.assertFalse((self.web.migration_tls / 'primary.example.com').exists())
+        self.assertEqual(command.call_count, 1)
+        self.assertEqual(command.call_args.kwargs['env']['LC_ALL'], 'C')
+
 
 class MigrationSSLTests(unittest.TestCase):
     import_bundle = TargetImportTests.import_bundle

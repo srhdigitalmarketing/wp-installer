@@ -460,10 +460,18 @@ class TargetMigration:
             return False
         # Validate hostname, expiry and matching public keys without printing
         # private PEM bytes. Invalid/expired imports wait for the DNS ACME job.
-        for arguments in (['x509', '-in', str(certificate), '-noout', '-checkhost', host],
-                          ['x509', '-in', str(certificate), '-noout', '-checkend', '86400']):
-            if self.manager.runner(['openssl', *arguments], check=False).returncode:
-                return False
+        # OpenSSL 3.0 x509 -checkhost prints the result but still exits zero
+        # for a mismatch. Require its exact positive result, never exit status
+        # alone. Locale is fixed so diagnostic text is deterministic.
+        match = self.manager.runner(['openssl', 'x509', '-in', str(certificate),
+                                     '-noout', '-checkhost', host], check=False,
+                                    env={'LC_ALL': 'C'})
+        if match.returncode or (match.stdout or '').strip() != f'Hostname {host} does match certificate':
+            return False
+        expiry = self.manager.runner(['openssl', 'x509', '-in', str(certificate),
+                                      '-noout', '-checkend', '86400'], check=False)
+        if expiry.returncode:
+            return False
         public = self.manager.runner(['openssl', 'x509', '-in', str(certificate), '-pubkey', '-noout'], check=False)
         private = self.manager.runner(['openssl', 'pkey', '-in', str(key), '-passin', 'pass:', '-pubout'], check=False)
         if public.returncode or private.returncode or not public.stdout or public.stdout != private.stdout:

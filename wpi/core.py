@@ -226,8 +226,10 @@ class Manager:
         os.chmod(self.data, 0o700)
         WWW.mkdir(parents=True, exist_ok=True, mode=0o755)
         web = WebStack(self.runner, stack, php)
-        web.install_default_guard()
+        # Minimal/cloud images can prevent apt from starting daemons. The
+        # managed guard reloads its configuration, so start the service first.
         self.runner(['systemctl', 'enable', '--now', 'nginx' if stack == 'nginx' else 'apache2'])
+        web.install_default_guard()
         web.validate_reload()
         # Use Ubuntu Certbot's existing renewal timer; hooks reload only after successful renewal.
         self.runner(['systemctl', 'enable', '--now', 'certbot.timer'])
