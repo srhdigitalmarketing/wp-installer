@@ -449,11 +449,18 @@ def verify_redis_cache(site):
         assert cache_probe(peer, 'wpi-peer-sentinel', 'keep-peer-cache')['matches'] is True
 
         # The user can disable cache, and optimize must respect that choice.
+        enabled_snapshot = manager.backup(site['id'])
         subprocess.run(['/usr/local/bin/wpi', 'redis-disable', site['id']],
                        check=True, capture_output=True, text=True)
         subprocess.run(['/usr/local/bin/wpi', 'optimize'], check=True, capture_output=True, text=True)
         assert manager.site(site['id'])['redis_cache']['enabled'] is False
         assert expected_request(site['primary'], 200)[0] == 200
+        disabled_restore, _ = manager.restore(site['id'], enabled_snapshot)
+        assert disabled_restore['redis_cache']['enabled'] is False
+        assert manager.site(site['id'])['redis_cache']['enabled'] is False
+        assert manager.wp(site, 'eval', "echo wp_using_ext_object_cache() ? 'yes' : 'no';").stdout == 'no'
+        assert expected_request(site['primary'], 200)[0] == 200
+        assert cache_probe(peer, 'wpi-peer-sentinel', 'keep-peer-cache')['matches'] is True
         subprocess.run(['/usr/local/bin/wpi', 'redis-enable', site['id']],
                        check=True, capture_output=True, text=True)
         assert manager.site(site['id'])['redis_cache']['enabled'] is True
@@ -462,7 +469,7 @@ def verify_redis_cache(site):
         print(f'Real Redis Object Cache 3.0.0: WP-CLI/PHP persistence; '
               f'20 option reads SQL cold={cold["queries"]}, warm={warm["queries"]}; '
               'two-site flush isolation, UNIX-only listeners, visible outage and explicit repair recovery; '
-              'disable respected by optimize.', flush=True)
+              'disable respected by optimize and restore of an enabled snapshot.', flush=True)
         return peer
     finally:
         probe.unlink(missing_ok=True)

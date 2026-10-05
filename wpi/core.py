@@ -215,6 +215,8 @@ class Manager:
         if self.config.get('redis_cache', {}).get('enabled') \
                 and site.get('redis_cache', {}).get('enabled'):
             self.redis.prepare_site_config(site['id'])
+        elif site.get('redis_cache', {}).get('enabled') is False:
+            self.redis.prepare_disabled_config(site['id'])
 
     def _enable_site_cache(self, identifier):
         if self.config.get('redis_cache', {}).get('enabled'):
@@ -665,6 +667,10 @@ class Manager:
                 self.wp(site, 'search-replace', pattern, replacement, '--regex', '--precise',
                         '--recurse-objects', '--all-tables-with-prefix', '--skip-columns=guid',
                         '--regex-delimiter=~', '--report-changed-only')
+            # Bulk SQL replacement bypasses WordPress cache invalidation. A
+            # persistent old alloptions value can make the following update
+            # report failure because SQL already contains the new value.
+            self.wp(site, 'cache', 'flush')
             self.wp(site, 'option', 'update', 'home', 'https://' + new)
             self.wp(site, 'option', 'update', 'siteurl', 'https://' + new)
             site['primary'] = new
@@ -754,6 +760,9 @@ class Manager:
             self.runner(['chown', 'root:www-data', str(sql)])
             os.chmod(sql, 0o640)
             self.wp(site, 'db', 'import', str(sql), '--quiet')
+        if site.get('redis_cache', {}).get('enabled'):
+            # Includes rollback imports after failed domain/content changes.
+            self.wp(site, 'cache', 'flush')
 
     def restore(self, identifier, folder):
         current = self.site(identifier)

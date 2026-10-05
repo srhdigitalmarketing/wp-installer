@@ -377,6 +377,52 @@ class ActivationTests(unittest.TestCase):
         self.assertIn(self.a, self.backend.active)
         self.assertFalse(any(entry[1][0] not in ('config',) for entry in self.backend.wp_calls))
 
+    def test_disabled_restore_removes_only_official_snapshot_dropin_before_wordpress_boot(self):
+        self.cache.enable_site(self.a)
+        self.cache.disable_site(self.a)
+        site = self.manager.site(self.a)
+        target = Path(site['root']) / 'wp-content/object-cache.php'
+        target.write_bytes(DROPIN)  # Restored snapshot taken while Redis was enabled.
+        self.backend.calls.clear()
+        self.backend.wp_calls.clear()
+        report = self.cache.prepare_disabled_config(self.a)
+        self.assertTrue(report['changed'])
+        self.assertFalse(target.exists())
+        self.assertNotIn(self.a, self.backend.active)
+        self.assertFalse(self.manager.site(self.a)['redis_cache']['enabled'])
+        self.assertIn("define('WP_REDIS_DISABLED', \"true\");", (Path(site['root']) / 'wp-config.php').read_text())
+        self.assertFalse(any(call[0] == 'systemctl' for call in self.backend.calls))
+        self.assertTrue(all(entry[1][0] == 'config' for entry in self.backend.wp_calls))
+        before = (Path(site['root']) / 'wp-config.php').read_bytes()
+        self.assertFalse(self.cache.prepare_disabled_config(self.a)['changed'])
+        self.assertEqual((Path(site['root']) / 'wp-config.php').read_bytes(), before)
+
+    def test_disabled_restore_refuses_foreign_snapshot_dropin_without_mutation(self):
+        site = self.manager.site(self.a)
+        site['redis_cache'] = {'enabled': False}
+        self.manager.save_site(site)
+        target = Path(site['root']) / 'wp-content/object-cache.php'
+        target.write_bytes(b'<?php // another plugin')
+        before = (Path(site['root']) / 'wp-config.php').read_bytes()
+        with self.assertRaisesRegex(ValueError, 'tidak ditimpa'):
+            self.cache.prepare_disabled_config(self.a)
+        self.assertEqual(target.read_bytes(), b'<?php // another plugin')
+        self.assertEqual((Path(site['root']) / 'wp-config.php').read_bytes(), before)
+        self.assertFalse(self.backend.calls)
+        self.assertFalse(self.backend.wp_calls)
+
+    def test_readiness_failure_reports_safe_errno_and_state_before_rollback(self):
+        self.cache.install()
+        with mock.patch.object(self.cache, 'connect', side_effect=FileNotFoundError(2, 'SECRET key:error')), \
+                mock.patch.object(redis_cache.time, 'sleep'):
+            with self.assertRaises(RuntimeError) as failure:
+                self.cache.prepare_site_config(self.a)
+        self.assertIn('"errno": 2', str(failure.exception))
+        self.assertIn('"error_type": "FileNotFoundError"', str(failure.exception))
+        self.assertNotIn('SECRET', str(failure.exception))
+        self.assertNotIn('key:error', str(failure.exception))
+        self.assertFalse(self.manager.site(self.a).get('redis_cache', {}).get('enabled'))
+
     def test_restore_candidate_outside_managed_site_is_rejected(self):
         self.cache.enable_site(self.a)
         foreign = self.base / 'outside.php'

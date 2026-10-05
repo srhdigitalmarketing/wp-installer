@@ -280,6 +280,25 @@ class ManagerTests(unittest.TestCase):
         backup.assert_not_called()
         self.web.write_site.assert_not_called()
 
+    def test_primary_replacement_invalidates_persistent_options_before_updates(self):
+        self.site['aliases'] = ['new.example.com']
+        self.manager.save_site(self.site)
+        cached = {'stale': False}
+
+        def wp(site, *args, **kwargs):
+            if args[0] == 'search-replace':
+                cached['stale'] = True
+            elif args[:2] == ('cache', 'flush'):
+                cached['stale'] = False
+            elif args[:2] == ('option', 'update') and cached['stale']:
+                raise RuntimeError('Bulk SQL already changed the cached option.')
+            return subprocess.CompletedProcess([], 0, '', '')
+
+        with mock.patch.object(self.manager, 'backup', return_value=self.base / 'backup'), \
+             mock.patch.object(self.manager, 'wp', side_effect=wp):
+            changed, _ = self.manager.set_primary(self.site['id'], 'new.example.com')
+        self.assertEqual(changed['primary'], 'new.example.com')
+
     def test_failed_alias_promotion_restores_original_roles_and_database(self):
         self.site['aliases'] = ['new.example.com', 'keep.example.com']
         self.site['secondary'] = ['redirect.example.com']

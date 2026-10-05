@@ -113,7 +113,10 @@ class RedisConnection:
             return value.decode('utf-8', errors='replace')
         if kind == b'-':
             # Do not expose raw server errors, potentially containing a key or secret.
-            raise RedisProtocolError('Perintah Redis ditolak atau gagal.')
+            error = RedisProtocolError('Perintah Redis ditolak atau gagal.')
+            code = value.split(b' ', 1)[0].decode('ascii', errors='ignore')
+            error.category = code if code in ('WRONGPASS', 'NOAUTH', 'NOPERM', 'ERR') else 'unknown'
+            raise error
         if kind == b':':
             return int(value)
         if kind == b'$':
@@ -331,15 +334,47 @@ class RedisCache:
         elif start:
             self.runner(['systemctl', 'enable', '--now', self.service(identifier)])
         if start:
+            last_error = None
             for attempt in range(15):
                 try:
                     with self._client(identifier) as client:
                         if client.command('PING') == 'PONG':
                             return
-                except (OSError, RedisProtocolError):
+                except (OSError, RedisProtocolError) as error:
+                    last_error = error
                     if attempt < 14:
                         time.sleep(0.2)
-            raise RuntimeError('Instance Redis WPI belum siap; konfigurasi dipulihkan.')
+            diagnostic = self._readiness_diagnostic(identifier, last_error)
+            raise RuntimeError('Instance Redis WPI belum siap; konfigurasi dipulihkan. '
+                               'Diagnostik aman: ' + json.dumps(diagnostic, sort_keys=True))
+
+    def _readiness_diagnostic(self, identifier, error):
+        """Capture structural failure before rollback, never raw journal or errors."""
+        types = ('ConnectionRefusedError', 'PermissionError', 'FileNotFoundError',
+                 'TimeoutError', 'RedisProtocolError', 'OSError')
+        diagnostic = {'error_type': type(error).__name__ if type(error).__name__ in types else 'unknown'}
+        if isinstance(error, OSError):
+            diagnostic['errno'] = error.errno
+        if isinstance(error, RedisProtocolError):
+            diagnostic['protocol_category'] = getattr(error, 'category', 'unknown')
+        fields = ('ActiveState', 'SubState', 'Result', 'ExecMainStatus')
+        try:
+            result = self.runner(['systemctl', 'show', self.service(identifier),
+                                  *['--property=' + key for key in fields]], check=False, timeout=10)
+            values = dict(line.split('=', 1) for line in str(result.stdout or '').splitlines() if '=' in line)
+            diagnostic['service'] = {key: values[key] for key in fields if key in values and
+                                     re.fullmatch(r'[A-Za-z0-9_-]{1,64}', values[key])}
+            journal = self.runner(['journalctl', '--unit', self.service(identifier), '--no-pager',
+                                   '--output=cat', '--lines=40'], check=False, timeout=10)
+            content = str(journal.stdout or '').lower()
+            categories = {'acl_user_keyword': 'should start with user keyword',
+                          'acl_load_error': 'error loading acl', 'config_error': 'fatal config file error',
+                          'permission_denied': 'permission denied', 'missing_file': 'no such file',
+                          'address_family': 'address family not supported', 'ready': 'ready to accept'}
+            diagnostic['journal_categories'] = {key: content.count(value) for key, value in categories.items()}
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            diagnostic['service'] = 'unavailable'
+        return diagnostic
 
     def optimize(self):
         """Rebudget managed instances; never start a deliberately stopped service."""
@@ -459,7 +494,7 @@ class RedisCache:
             self._config_set(checked, path, name, value, raw=True)
         return True
 
-    def _stage_config(self, site):
+    def _stage_config(self, site, disabled=False):
         root = Path(site['root'])
         original = _bytes(root / 'wp-config.php')
         if original is None:
@@ -473,7 +508,10 @@ class RedisCache:
             os.chmod(folder, 0o750)
             self.runner(['chown', 'root:www-data', folder])
             self.runner(['chown', 'www-data:www-data', str(candidate)])
-            self.overlay_config(site, candidate)
+            if disabled:
+                self._config_set(site, candidate, 'WP_REDIS_DISABLED', 'true', raw=True)
+            else:
+                self.overlay_config(site, candidate)
             self.runner([f'/usr/bin/php{self.manager.config["php_version"]}', '-n', '-l', str(candidate)])
             _atomic_write(root / 'wp-config.php', candidate.read_bytes(), mode=0o640)
             self.runner(['chown', 'www-data:www-data', str(root / 'wp-config.php')])
@@ -498,6 +536,36 @@ class RedisCache:
             if not was_active:
                 self._check(['systemctl', 'disable', '--now', self.service(site['id'])])
             raise
+
+    def prepare_disabled_config(self, identifier):
+        """Keep a local opt-out when a restored archive contains an old drop-in."""
+        site = self._site(identifier)
+        if site.get('redis_cache', {}).get('enabled') is not False:
+            return {'site_id': site['id'], 'changed': False}
+        target, current = self._dropin(site)
+        result = self.manager.wp(site, 'config', 'list', 'WP_REDIS_DISABLED', '--strict',
+                                 '--format=json', check=False)
+        disabled = False
+        if result.returncode == 0:
+            try:
+                rows = json.loads(result.stdout)
+                disabled = any(row.get('key') == 'WP_REDIS_DISABLED' and
+                               str(row.get('value')).lower() == 'true' for row in rows)
+            except (ValueError, TypeError):
+                pass
+        if current is None and disabled:
+            return {'site_id': site['id'], 'changed': False}
+        snapshots = self._capture(site)
+        self._backup(site, snapshots)
+        try:
+            if not disabled:
+                self._stage_config(site, disabled=True)
+            if current is not None:
+                target.unlink()
+        except BaseException:
+            self._restore(snapshots)
+            raise
+        return {'site_id': site['id'], 'changed': True, 'enabled': False}
 
     def _prepare(self, site):
         count = len(set(self._ids()) | {site['id']})
