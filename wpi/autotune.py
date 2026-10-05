@@ -336,12 +336,57 @@ def render_pool(children, status_socket, resources=None):
     return content
 
 
-def capacity(resources):
-    """A steady-state bound with an explicit DB/OS and OPcache reservation."""
+def redis_reserve_bytes(resources):
+    """Reserve cache/overhead separately from DB/OS, without Redis I/O."""
+    redis = resources.get('redis_cache', {})
+    if not isinstance(redis, dict):
+        raise ValueError('Metadata resource Redis tidak valid.')
+    if redis.get('enabled') is not True:
+        return 0
+    reserve = redis.get('memory_reserve_bytes', 0)
+    limit = redis.get('maxmemory_mib', 0)
+    rss = redis.get('used_memory_rss_bytes')
+    rss = 0 if rss is None else rss
+    if any(type(value) is not int or value < 0 for value in (reserve, limit, rss)):
+        raise ValueError('Anggaran RAM Redis harus berupa byte/MiB positif.')
+    # maxmemory bounds cached data, not total process RSS. The managed policy
+    # provides a larger reserve for native overhead across site instances.
+    return max(reserve, 2 * limit * MIB, rss)
+
+
+def memory_reservations(resources, opcache_mib):
+    """Shared steady-state RAM accounting for FPM and manual PHP validation."""
     total = max(0, resources.get('memory_total', 0))
     reserve = max(384 * MIB, int(total * 0.35))
-    opcache = profile(resources)['opcache_mib'] * MIB
-    budget = max(0, min(int(total * 0.50), total - reserve - opcache))
+    opcache = opcache_mib * MIB
+    redis = redis_reserve_bytes(resources)
+    budget = max(0, min(int(total * 0.50), total - reserve - opcache - redis))
+    return {'memory_budget': budget, 'reserve_bytes': reserve + opcache + redis,
+            'os_database_reserve_bytes': reserve, 'opcache_reserve_bytes': opcache,
+            'redis_reserve_bytes': redis}
+
+
+def redis_resource_report(resources):
+    """Expose aggregate budgets/cached measurements, never Redis key data."""
+    redis = resources.get('redis_cache', {})
+    enabled = isinstance(redis, dict) and redis.get('enabled') is True
+    report = {'enabled': enabled, 'memory_reserve_mib': redis_reserve_bytes(resources) // MIB,
+              'maxmemory_mib': redis.get('maxmemory_mib', 0) if enabled else 0,
+              'planned_maxmemory_mib': redis.get('planned_maxmemory_mib') if enabled else None,
+              'site_count': redis.get('site_count', 0) if enabled else 0,
+              'profile_available': redis.get('profile_available', True) if enabled else True}
+    for source, target in (('used_memory_bytes', 'used_memory_mib'),
+                           ('used_memory_rss_bytes', 'used_memory_rss_mib')):
+        value = redis.get(source) if enabled else None
+        report[target] = round(value / MIB, 2) if type(value) is int and value >= 0 else None
+    report['sampled_at'] = redis.get('sampled_at') if enabled else None
+    return report
+
+
+def capacity(resources):
+    """A steady-state bound with explicit DB/OS, Redis and OPcache reserves."""
+    reservations = memory_reservations(resources, profile(resources)['opcache_mib'])
+    budget = reservations['memory_budget']
     raw_rss = resources.get('worker_rss', [])
     if isinstance(raw_rss, (int, float)):
         raw_rss = [raw_rss]
@@ -354,8 +399,7 @@ def capacity(resources):
     worker = max(floor, math.ceil(p90 * 1.25))
     memory_cap = max(1, budget // worker)
     cpu_cap = max(1, math.floor(max(0.1, resources.get('cpus', 1)) * 8))
-    return {'capacity': min(cpu_cap, memory_cap), 'worker_bytes': worker,
-            'memory_budget': budget, 'reserve_bytes': reserve + opcache}
+    return {'capacity': min(cpu_cap, memory_cap), 'worker_bytes': worker, **reservations}
 
 
 def initial_children(resources):
@@ -624,6 +668,37 @@ class AutoTuner:
         result = detect_resources(self.proc, self.sys, target_pid=pid if pid and pid > 0 else None)
         if self.config_file.exists():
             cfg = json.loads(self.config_file.read_text(encoding='utf-8'))
+            redis = cfg.get('redis_cache', {})
+            if not isinstance(redis, dict):
+                raise ValueError('Metadata konfigurasi Redis WPI tidak valid.')
+            if redis.get('enabled') is True:
+                from .redis_cache import redis_resource_profile
+                count = redis.get('site_count', 0)
+                reserve_mib = redis.get('reserve_mib', 0)
+                reserve_bytes = redis.get('memory_reserve_bytes', 0)
+                current_limit = redis.get('maxmemory_mib', 0)
+                if any(type(value) is not int or value < 0 for value in
+                       (count, reserve_mib, reserve_bytes, current_limit)):
+                    raise ValueError('Anggaran Redis terkonfigurasi tidak valid.')
+                profile_available = True
+                try:
+                    planned = redis_resource_profile(result.get('memory_total', 0), site_count=max(1, count))
+                except ValueError:
+                    # A hardware downsize can make the cache's native costs
+                    # impossible to fit. Keep its previous reservation and
+                    # exhaust the PHP budget rather than authorizing growth.
+                    profile_available = False
+                    planned = {'maxmemory_mib': 0,
+                               'memory_reserve_bytes': max(0, result.get('memory_total', 0))}
+                normalized = {key: redis[key] for key in
+                              ('used_memory_bytes', 'used_memory_rss_bytes', 'sampled_at') if key in redis}
+                normalized.update({'enabled': True, 'site_count': count,
+                                   'maxmemory_mib': current_limit,
+                                   'planned_maxmemory_mib': planned['maxmemory_mib'],
+                                   'profile_available': profile_available,
+                                   'memory_reserve_bytes': max(reserve_bytes, reserve_mib * MIB,
+                                                              planned['memory_reserve_bytes'])})
+                result = {**result, 'redis_cache': normalized}
             settings = cfg.get('php_settings', {})
             if settings:
                 from .php_settings import configured_profile
@@ -761,6 +836,7 @@ class AutoTuner:
                 'effective_cpus': round(resources['cpus'], 2),
                 'worker_estimate_mib': round(decision['worker_bytes'] / MIB, 1),
                 'memory_budget_mib': decision['memory_budget'] // MIB,
+                'redis_cache': redis_resource_report(resources),
                 'cpu_percent': round(resources['cpu_load'] * 100, 1) if resources.get('cpu_load') is not None else None,
                 'memory_psi_percent': resources.get('memory_psi'),
                 'queue': telemetry.get('listen queue') if telemetry and telemetry.get('queue_measured') is not False else None,

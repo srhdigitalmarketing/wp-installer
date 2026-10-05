@@ -6,7 +6,7 @@ Video tersebut belum memperlihatkan Alias, Set as Primary, atau migrasi server d
 tidak diregenerasi dalam rilis ini. Transkrip historis di bawah dipertahankan
 untuk menjelaskan rekaman yang tersedia.
 
-## Diagram menu v1.5.0
+## Diagram menu v1.6.0
 
 Diagram berikut menunjukkan menu terbaru; ini bukan transkrip video lama:
 
@@ -17,6 +17,8 @@ Diagram berikut menunjukkan menu terbaru; ini bukan transkrip video lama:
 (15) Migrasi server   -> IP, username, password SSH; salin situs; auto-SSL setelah DNS
 (16) Repair situs    -> Diagnosis dan perbaikan saat dipilih; backup config privat
 (17) PHP limit       -> Memory/upload seluruh situs; otomatis atau nilai MB
+(18) Optimasi        -> Redis object cache + PHP/FPM sesuai RAM/CPU efektif
+(19) Cache Redis     -> Status, aktifkan, flush, atau nonaktifkan cache per situs
 ```
 
 Satu situs mempunyai satu Primary. Untuk menjadikan domain baru sebagai primary,
@@ -94,7 +96,7 @@ Kalimat sukses bootstrap yang memang terdapat dalam `install.sh`:
 ### Adegan 3 — menu asli pada rekaman v1.0.0
 
 Cuplikan berikut adalah menu historis sebelum stack dikonfigurasi; menu terbaru
-untuk nomor 3, 4, dan 5 ditunjukkan pada diagram v1.5.0 di atas:
+untuk nomor 3, 4, dan 5 ditunjukkan pada diagram v1.6.0 di atas:
 
 ```text
 WPI — WordPress Installer  v1.0.0
@@ -244,5 +246,5 @@ DEMO SIMULASI — pemasangan server & SSL tidak dijalankan dalam video
 ```
 
 Sumber transkrip historis: `README.md`, `wpi/cli.py`, `wpi/core.py`, dan
-`install.sh` pada rilis v1.0.0. Diagram terbaru mengikuti menu v1.5.0. Overlay
+`install.sh` pada rilis v1.0.0. Diagram terbaru mengikuti menu v1.6.0. Overlay
 penjelasan dibedakan dari keluaran terminal asli.

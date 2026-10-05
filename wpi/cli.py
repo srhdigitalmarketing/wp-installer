@@ -213,6 +213,19 @@ def php_settings_interactive(manager):
     show_php_settings(result)
 
 
+def redis_interactive(manager):
+    print(json.dumps(manager.redis_status(), ensure_ascii=False, indent=2, sort_keys=True))
+    mode = ask('Redis: 1=Aktifkan situs, 2=Kosongkan cache situs, 3=Nonaktifkan situs, 0=Kembali', '0')
+    if mode == '0':
+        return
+    actions = {'1': manager.enable_redis, '2': manager.redis_flush, '3': manager.redis_disable}
+    if mode not in actions:
+        raise ValueError('Pilihan harus 0, 1, 2, atau 3.')
+    identifier = select_site(manager)
+    report = run_operation(actions[mode], identifier)
+    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+
+
 def menu(manager):
     choices = [
         ('1', 'Install WordPress otomatis'), ('2', 'Daftar situs & domain'),
@@ -224,6 +237,7 @@ def menu(manager):
         ('13', 'Lihat kredensial situs'), ('14', 'Lanjutkan instalasi gagal'),
         ('15', 'Migrasi otomatis ke server baru'),
         ('16', 'Auto repair situs / error 500'), ('17', 'PHP memory limit & upload size'),
+        ('18', 'Optimalkan Redis & PHP'), ('19', 'Status / kelola cache Redis'),
         ('0', 'Keluar'),
     ]
     while True:
@@ -290,6 +304,10 @@ def menu(manager):
                 show_repair(run_operation(manager.repair_site, select_site(manager)))
             elif choice == '17':
                 php_settings_interactive(manager)
+            elif choice == '18':
+                print(json.dumps(run_operation(manager.optimize), ensure_ascii=False, indent=2, sort_keys=True))
+            elif choice == '19':
+                redis_interactive(manager)
             else:
                 print('Pilihan tidak dikenal.')
         except (ValueError, RuntimeError, OSError) as error:
@@ -333,6 +351,14 @@ def parser():
     commands.add_parser('autotune-enable', help='Aktivasi otomatis saat upgrade instalasi WPI.')
     commands.add_parser('autotune-tick', help='Perintah internal timer PHP-FPM.')
     commands.add_parser('autotune-status', help='Lihat kapasitas dan keputusan PHP-FPM otomatis.')
+    commands.add_parser('optimize', help='Aktifkan Redis dan optimalkan PHP sesuai resource server.')
+    commands.add_parser('redis-status', help='Status cache Redis per situs tanpa mengubah server.')
+    commands.add_parser('performance-tick', help='Perintah internal timer resource Redis.')
+    redis_enable = commands.add_parser('redis-enable', help='Aktifkan cache Redis untuk situs.')
+    redis_enable.add_argument('site', nargs='?', help='ID/domain; kosong untuk seluruh situs aktif.')
+    for name in ('redis-flush', 'redis-disable'):
+        command = commands.add_parser(name)
+        command.add_argument('site')
     repair = commands.add_parser('repair', help='Diagnosis dan repair situs yang dipilih.')
     repair.add_argument('site')
     repair.add_argument('--check', action='store_true', help='Diagnosis saja, tanpa mengubah server.')
@@ -395,6 +421,21 @@ def main(argv=None):
         if command == 'autotune-status':
             print(json.dumps(manager.autotune_status(), ensure_ascii=False, sort_keys=True))
             return 0
+        if command == 'redis-status':
+            print(json.dumps(manager.redis_status(), ensure_ascii=False, sort_keys=True))
+            return 0
+        if command == 'performance-tick':
+            acquired = False
+            try:
+                with operation_lock():
+                    acquired = True
+                    report = manager.performance_tick()
+            except ValueError:
+                if acquired:
+                    raise
+                report = {'skipped': 'operation-busy'}
+            print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+            return 0
         if command == 'migration-status':
             print(json.dumps({'outgoing': Migration(manager).status(),
                               'incoming': TargetMigration(manager).status()},
@@ -423,6 +464,14 @@ def main(argv=None):
             run_operation(manager.setup, args.stack, args.database)
         elif command == 'autotune-enable':
             print(json.dumps(run_operation(manager.enable_autotune), ensure_ascii=False, sort_keys=True))
+        elif command == 'optimize':
+            print(json.dumps(run_operation(manager.optimize), ensure_ascii=False, sort_keys=True))
+        elif command == 'redis-enable':
+            print(json.dumps(run_operation(manager.enable_redis, args.site), ensure_ascii=False, sort_keys=True))
+        elif command == 'redis-flush':
+            print(json.dumps(run_operation(manager.redis_flush, args.site), ensure_ascii=False, sort_keys=True))
+        elif command == 'redis-disable':
+            print(json.dumps(run_operation(manager.redis_disable, args.site), ensure_ascii=False, sort_keys=True))
         elif command == 'migrate':
             migrate_interactive(manager, args.host, args.username, args.port)
         elif command == 'migration-import':

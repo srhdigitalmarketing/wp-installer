@@ -346,6 +346,8 @@ class SiteRepair:
         if fresh:
             self._config_set(site, candidate, 'DISALLOW_FILE_EDIT', 'true', raw=True)
             self._config_set(site, candidate, 'WP_AUTO_UPDATE_CORE', 'minor')
+        if site.get('redis_cache', {}).get('enabled'):
+            self.manager.redis.overlay_config(site, candidate=candidate)
         if not self._lint(candidate):
             raise ValueError('Kandidat config gagal PHP lint; config aktif tidak diubah.')
         self.runner(['chown', 'www-data:www-data', str(candidate)])

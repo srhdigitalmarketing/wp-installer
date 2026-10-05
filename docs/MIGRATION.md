@@ -1,4 +1,4 @@
-# Migrasi otomatis WPI v1.5.0
+# Migrasi otomatis WPI v1.6.0
 
 Pengaturan memory/upload dari menu 17 ikut disalin dan diperiksa terhadap RAM
 server tujuan sebelum setup. Target yang terlalu kecil ditolak. Konfigurasi

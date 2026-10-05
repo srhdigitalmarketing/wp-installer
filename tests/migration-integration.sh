@@ -140,6 +140,14 @@ with mock.patch('wpi.core.check_dns'), mock.patch.object(WebStack, 'obtain_certi
     manager.add_domain(site['id'], HOSTS[2], kind='redirect')
 site = manager.site(site['id'])
 manager.set_php_settings(memory_limit=500, upload_max_filesize=128)
+assert site['redis_cache']['enabled'], 'Source installation did not enable persistent object cache.'
+assert manager.wp(site, 'eval', "echo wp_using_ext_object_cache() ? 'yes' : 'no';").stdout == 'yes'
+manager.wp(site, 'cache', 'set', 'wpi-source-only', 'source-cache-must-stay', 'wpi_ci')
+assert manager.wp(site, 'eval', "$found=false; $value=wp_cache_get('wpi-source-only', 'wpi_ci', false, $found); "
+                  "echo ($found && $value === 'source-cache-must-stay') ? 'hit' : 'miss';").stdout == 'hit'
+redis_credentials = manager.data / 'redis/credentials' / (site['id'] + '.json')
+assert redis_credentials.stat().st_mode & 0o777 == 0o600
+redis_password_hash = hashlib.sha256(json.loads(redis_credentials.read_text())['password'].encode()).hexdigest()
 post = manager.wp(site, 'post', 'create', '--post_type=post', '--post_status=publish',
                   '--post_title=Migration preserved article', '--post_name=migration-preserved',
                   '--post_content=Migration preserved content', '--porcelain').stdout.strip()
@@ -149,6 +157,7 @@ upload.parent.mkdir(exist_ok=True, parents=True)
 upload.write_bytes(os.urandom(128 * 1024))
 subprocess.run(['chown', '-R', 'www-data:www-data', str(upload.parent)], check=True)
 manifest = {'site': site, 'post': post,
+            'redis_password_hash': redis_password_hash,
             'upload_sha256': hashlib.sha256(upload.read_bytes()).hexdigest(),
             'database_password_hash': hashlib.sha256(json.loads(
                 (manager.data / 'credentials' / (site['id'] + '.json')).read_text()
@@ -159,6 +168,7 @@ manifest = {'site': site, 'post': post,
                            for host in HOSTS}}
 Path('/root/source-manifest.json').write_text(json.dumps(manifest))
 print('Source fixture installed: WordPress, content, administrator, upload, Alias, and Redirect.', flush=True)
+print('Source persistent Redis cache enabled; private credential hash and source-only cache sentinel recorded.', flush=True)
 PY
 docker cp "$WPI_CI_WORK/source-fixture.py" "$WPI_CI_SOURCE:/root/source-fixture.py"
 docker exec "$WPI_CI_SOURCE" python3 -u /root/source-fixture.py
@@ -452,6 +462,20 @@ for action in ('is-enabled', 'is-active'):
 subprocess.run(['systemctl', 'is-enabled', '--quiet', 'wpi-migration-ssl.timer'], check=True)
 
 if stage == 'before-dns':
+    assert site['redis_cache']['enabled'], 'Target did not enable the migrated persistent cache.'
+    redis_credentials = manager.data / 'redis/credentials' / (site['id'] + '.json')
+    assert redis_credentials.stat().st_mode & 0o777 == 0o600
+    redis_password = json.loads(redis_credentials.read_text())['password']
+    assert hashlib.sha256(redis_password.encode()).hexdigest() != manifest['redis_password_hash'], \
+        'Destination reused the source Redis password.'
+    assert manager.wp(site, 'config', 'get', 'WP_REDIS_PASSWORD').stdout.strip() == redis_password
+    assert manager.wp(site, 'config', 'get', 'WP_REDIS_PATH').stdout.strip() == site['redis_cache']['socket']
+    source_key = manager.wp(site, 'eval', "$found=false; wp_cache_get('wpi-source-only', 'wpi_ci', false, $found); "
+                            "echo $found ? 'unexpected-source-key' : 'fresh-cache';").stdout
+    assert source_key == 'fresh-cache', 'Source Redis entries were copied to the destination.'
+    assert manager.wp(site, 'eval', "echo wp_using_ext_object_cache() ? 'yes' : 'no';").stdout == 'yes'
+    listeners = subprocess.run(['ss', '-ltnp'], check=True, capture_output=True, text=True).stdout
+    assert 'redis-server' not in listeners, 'Destination Redis opened a TCP listener.'
     credentials = json.loads((manager.data / 'credentials' / (site['id'] + '.json')).read_text())
     new_password = credentials['database_password']
     # Only hashes are compared with the source fixture. Password values stay
@@ -478,6 +502,16 @@ if stage == 'before-dns':
     assert manager.wp(site, 'maintenance-mode', 'is-active', check=False).returncode != 0
     manager.wp(site, 'core', 'verify-checksums')
     print('Raw source backup restored on destination: regenerated SQL credentials and migration ownership retained; database/content/admin/media accessible.', flush=True)
+    assert json.loads(redis_credentials.read_text())['password'] == redis_password
+    assert manager.wp(site, 'config', 'get', 'WP_REDIS_PASSWORD').stdout.strip() == redis_password
+    assert manager.wp(site, 'config', 'get', 'WP_REDIS_PATH').stdout.strip() == site['redis_cache']['socket']
+    manager.wp(site, 'cache', 'set', 'wpi-target-only', 'target-cache-persistence', 'wpi_ci')
+    persistent = manager.wp(site, 'eval', "$found=false; $value=wp_cache_get('wpi-target-only', 'wpi_ci', false, $found); "
+                            "echo (wp_using_ext_object_cache() && $found && "
+                            "$value === 'target-cache-persistence') ? 'hit' : 'miss';").stdout
+    assert persistent == 'hit', 'Target Redis cache did not persist across PHP processes after restore.'
+    print('Migration Redis proof: fresh destination password/socket, source cache entries excluded; '
+          'raw backup restore retained destination Redis credentials and cross-process persistent caching.', flush=True)
 
 def request(host, path, https=True):
     with tempfile.TemporaryDirectory() as directory:
@@ -539,6 +573,8 @@ if stage == 'before-dns':
     assert not Path('/root/certbot-fixture-hosts').exists()
     print('Before DNS: imported SQL, admin, media, roles, HTTPS fallback and private routes verified; SSL waits for destination challenge.', flush=True)
 elif stage == 'after-dns':
+    assert manager.wp(site, 'eval', "$found=false; $value=wp_cache_get('wpi-target-only', 'wpi_ci', false, $found); "
+                      "echo ($found && $value === 'target-cache-persistence') ? 'hit' : 'miss';").stdout == 'hit'
     def controller_diagnostics():
         journal = json.loads(target._journal_path(report['migration_id']).read_text())
         print('SSL retry state: ' + json.dumps({host: {
@@ -616,6 +652,12 @@ assert manager.wp(site, 'maintenance-mode', 'is-active', check=False).returncode
 assert manager.wp(site, 'user', 'get', 'migration_admin', '--field=user_pass').stdout.strip() == manifest['admin_hash']
 manager.wp(site, 'core', 'is-installed')
 assert Path(json.loads(Path('/root/migration-report.json').read_text())['backup']).is_dir()
+assert manager.wp(site, 'eval', "$found=false; $value=wp_cache_get('wpi-source-only', 'wpi_ci', false, $found); "
+                  "echo ($found && $value === 'source-cache-must-stay') ? 'hit' : 'miss';").stdout == 'hit', \
+    'Migration discarded the source cache.'
+assert manager.wp(site, 'eval', "$found=false; wp_cache_get('wpi-target-only', 'wpi_ci', false, $found); "
+                  "echo $found ? 'unexpected-target-key' : 'isolated';").stdout == 'isolated'
 print('Source retained: WordPress remains installed, maintenance mode cleared, and rollback snapshot available.', flush=True)
+print('Source Redis cache retained and isolated from new destination cache.', flush=True)
 PY
 printf 'Migration integration passed: two Ubuntu servers, real root/non-root encrypted SSH, password sudo, database/media/admin/roles preserved, and scheduled auto-SSL after DNS. Public ACME issuance was a disposable fixture.\n'

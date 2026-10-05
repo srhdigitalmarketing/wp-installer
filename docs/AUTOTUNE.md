@@ -7,7 +7,7 @@ spare worker seperti pada panel web.
 
 Instalasi baru otomatis mengaktifkan fitur ini saat setup stack selesai.
 Pada server yang sudah memakai WPI v1.0.0, v1.1.0, v1.2.0, v1.2.1, atau v1.2.2,
-jalankan ulang bootstrap v1.5.0 sesuai [README](../README.md#instalasi-di-ubuntu).
+jalankan ulang bootstrap v1.6.0 sesuai [README](../README.md#instalasi-di-ubuntu).
 Stack yang sudah selesai disiapkan akan diaktifkan otomatis, sementara situs,
 database, domain, dan
 backup tetap digunakan.
@@ -29,6 +29,14 @@ kapasitas juga mengikuti CPU efektif, dihitung dari delapan worker per CPU.
 Mulai v1.2.0, tidak ada batas tetap 128 worker: WPI memakai nilai yang lebih
 kecil antara batas CPU dan anggaran memori, dengan minimum satu worker.
 Batas memori dapat menghasilkan angka yang lebih rendah lagi.
+
+Mulai v1.6.0, anggaran ini juga memperhitungkan [Redis per situs](REDIS.md).
+Anggaran worker adalah nilai yang lebih kecil antara 50% RAM dan RAM yang
+tersisa setelah cadangan OS/database (35%, minimum 384 MiB), OPcache, dan
+cadangan Redis. Cache Redis memakai sekitar 5% RAM, dengan cadangan sebesar
+dua kali batas cache ditambah 10 MiB per instance. Saat resize, FPM memakai
+cadangan terbesar antara batas Redis saat ini dan rencana baru hingga perubahan
+Redis diterapkan. Pengaturan PHP manual juga memakai anggaran yang sama.
 
 RAM dan CPU efektif dibaca ulang pada setiap siklus controller. Jika resource
 VPS ditambah dan sudah terlihat oleh Ubuntu, batas kapasitas dihitung ulang

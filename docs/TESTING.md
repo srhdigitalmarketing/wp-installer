@@ -95,6 +95,15 @@ Pengaturan PHP diuji sebagai transaksi seluruh situs: kedua konstanta WordPress,
 INI FPM/CLI, batas request web/phpMyAdmin, rollback aktivasi gagal, reset otomatis,
 persistensi controller, dan penolakan limit di atas anggaran RAM.
 
+Untuk Redis v1.6.0, tes unit memeriksa perhitungan satu anggaran server,
+cadangan overhead tiap instance, ACL/prefix/socket per situs, kepemilikan
+drop-in/plugin resmi, rollback aktivasi, flush terisolasi, dan pilihan disable.
+Anggaran PHP/FPM memakai cadangan OS/database, OPcache, dan Redis secara
+aditif; peningkatan RAM menghitung rencana Redis baru, sedangkan penurunan
+RAM mempertahankan cadangan konfigurasi lama sampai batas Redis diterapkan.
+Pembacaan resource FPM tidak boleh melakukan I/O Redis atau membuka kunci
+operasi situs. Status mengembalikan agregat tanpa password atau isi cache.
+
 `tests/integration.sh` hanya boleh dijalankan di VM CI sekali pakai. Skrip ini
 memasang dan mengubah layanan sistem serta menghapus stack/data bawaan VM,
 sehingga menolak berjalan tanpa `CI=true`, `WPI_DISPOSABLE_VM=1`, dan akses root.
@@ -108,6 +117,18 @@ upload berhasil, error upload PHP, serta HTTP 413 dari server web. Override haru
 bertahan saat autotune dan upgrade, lalu dapat di-reset ke otomatis. Sertifikat
 self-signed fixture dipercaya secara eksplisit untuk probe Repair; kode produksi
 tetap memvalidasi TLS.
+
+Fixture Redis memakai plugin resmi 3.0.0 dan dua situs WordPress nyata.
+Sebuah key yang dibuat proses WP-CLI dibaca proses WP-CLI berikutnya serta
+request PHP-FPM. Dua pembacaan 20 option non-autoload membandingkan jumlah
+query SQL setelah flush dan ketika cache hangat, tanpa mengukur waktu runner
+CI yang berubah-ubah. Flush situs pertama harus mempertahankan sentinel
+situs kedua; kedua Redis menggunakan socket Unix tanpa listener TCP.
+Menghentikan instance pertama harus menghasilkan kegagalan HTTP yang terlihat,
+sementara situs kedua tetap berjalan. Diagnosis, status, dan timer resource
+tidak boleh menjalankan kembali layanan; repair eksplisit harus memulihkannya.
+Disable dipertahankan oleh optimize, dan cache tetap bekerja sesudah restore,
+penggantian URL, serta promosi Alias. Lihat [Redis](REDIS.md) untuk kebijakan.
 
 ```bash
 sudo env CI=true WPI_DISPOSABLE_VM=1 bash tests/integration.sh nginx
@@ -167,6 +188,13 @@ dan file. Akun administrator, isi post, hash media, tabel, peran Alias/Redirect,
 dan konfigurasi PHP/FPM target diperiksa melalui layanan yang benar-benar
 berjalan. Situs sumber dan backup harus tetap tersedia dan maintenance telah
 dinonaktifkan setelah snapshot.
+
+Redis sumber dan tujuan menggunakan password berbeda, yang dibandingkan
+melalui hash privat. Sentinel cache sumber harus tidak ada di tujuan, sementara
+sentinel baru tujuan bertahan di proses PHP terpisah. Restore snapshot sumber
+di tujuan harus mempertahankan password/socket Redis tujuan. Setelah seluruh
+alur, cache sumber tetap tersedia dan tidak berisi sentinel tujuan. Data cache
+dan password tidak dicetak dalam log fixture.
 
 Sebelum simulasi DNS berpindah, target memakai pasangan sertifikat sumber yang
 ditransfer; HTTPS Primary/Alias dan Redirect 301 diperiksa. Controller terpasang

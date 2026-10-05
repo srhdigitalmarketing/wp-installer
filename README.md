@@ -3,6 +3,7 @@
 Panel terminal untuk memasang dan mengelola beberapa situs WordPress di Ubuntu.
 Jalankan `sudo wpi`, pilih nomor menu, lalu masukkan domain dan informasi situs.
 WPI mengatur server web, PHP-FPM, database, WordPress, virtual host, dan HTTPS.
+Redis object cache juga dipasang dan diaktifkan otomatis untuk setiap situs.
 
 [Tonton / unduh video demo CLI (MP4, 1080p)](https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.0.0/WPI-demo-Indonesia.mp4)
 — 2 menit 22 detik, narasi Indonesia dan subtitle. Video menggunakan menu/prompt
@@ -21,6 +22,12 @@ panduan terbaru di bawah; perilakunya berbeda dari rekaman lama.
   batas tetap 128 worker. Tidak perlu mengisi nilai PHP/FPM secara manual.
 - Beberapa situs, masing-masing memiliki direktori WordPress, database, dan
   akun database tersendiri.
+- **Redis object cache otomatis**, melalui PhpRedis dan plugin Redis Object Cache
+  resmi. Setiap situs memiliki instance dan Unix socket sendiri; flush cache satu
+  situs hanya memengaruhi situs tersebut. Anggaran cache mengikuti RAM efektif,
+  memakai eviction `allkeys-lfu`, dan dihitung bersama kapasitas PHP-FPM.
+  **Menu 18** mengoptimalkan Redis/PHP dan **menu 19** mengelola cache situs.
+  [Panduan Redis dan optimasi](docs/REDIS.md).
 - **Add domain**: pilih **Alias** untuk membuka situs WordPress yang sama pada
   domain tambahan, atau **Redirect** untuk pengalihan permanen **301** ke primary.
   Untuk domain tanpa www, pilihan **www** menambahkan hostname www juga.
@@ -86,43 +93,43 @@ sudo apt-get update
 sudo apt-get install -y curl ca-certificates
 
 curl -fL --proto '=https' --proto-redir '=https' \
-  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.5.0/install.sh \
+  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.6.0/install.sh \
   -o install.sh
 curl -fL --proto '=https' --proto-redir '=https' \
-  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.5.0/install.sh.sha256 \
+  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.6.0/install.sh.sha256 \
   -o install.sh.sha256
-sha256sum --check install.sh.sha256 && sudo bash install.sh --version v1.5.0
+sha256sum --check install.sh.sha256 && sudo bash install.sh --version v1.6.0
 
 sudo wpi
 ```
 
 Bootstrap memverifikasi SHA256 bundle dan memasang aplikasi serta kebutuhan
-dasarnya. Paket Nginx/Apache, database, PHP, dan Certbot dipasang saat situs
+dasarnya. Paket Nginx/Apache, database, PHP, Redis, dan Certbot dipasang saat situs
 WordPress pertama dibuat. Checksum dari release membantu mendeteksi file rusak;
 untuk memverifikasi identitas rilis, bandingkan hash dengan sumber yang Anda
 percaya atau tinjau kode pada tag versi tersebut.
 
 ### Memakai bundle lokal
 
-Unduh `wp-installer-v1.5.0.zip` dan `wp-installer-v1.5.0.zip.sha256`
-dari [release v1.5.0](https://github.com/srhdigitalmarketing/wp-installer/releases/tag/v1.5.0),
+Unduh `wp-installer-v1.6.0.zip` dan `wp-installer-v1.6.0.zip.sha256`
+dari [release v1.6.0](https://github.com/srhdigitalmarketing/wp-installer/releases/tag/v1.6.0),
 lalu salin ke server bersama `install.sh`.
 
 ```bash
-sudo bash install.sh --bundle ./wp-installer-v1.5.0.zip
+sudo bash install.sh --bundle ./wp-installer-v1.6.0.zip
 sudo wpi
 ```
 
 Hash yang diperoleh secara terpisah juga dapat diberikan melalui `--sha256`:
 
 ```bash
-sudo bash install.sh --bundle ./wp-installer-v1.5.0.zip --sha256 HASH_SHA256_RILIS
+sudo bash install.sh --bundle ./wp-installer-v1.6.0.zip --sha256 HASH_SHA256_RILIS
 ```
 
 Validasi bundle tanpa pemasangan, tanpa akses root, dan tanpa jaringan:
 
 ```bash
-bash install.sh --bundle ./wp-installer-v1.5.0.zip --check-only
+bash install.sh --bundle ./wp-installer-v1.6.0.zip --check-only
 ```
 
 Mode ini memerlukan Bash dan Python 3.10+. SHA256, keamanan path ZIP, kelengkapan
@@ -147,7 +154,8 @@ kredensial yang ditampilkan setelah pemasangan di pengelola password.
 | 11 | Update WordPress core | 12 | Status dan diagnosis |
 | 13 | Lihat kredensial situs | 14 | Lanjutkan instalasi gagal |
 | 15 | Migrasi otomatis ke server baru | 16 | Repair error situs |
-| 17 | PHP memory limit / max upload size | 0 | Keluar |
+| 17 | PHP memory limit / max upload size | 18 | Optimalkan Redis dan PHP |
+| 19 | Status / kelola cache Redis | 0 | Keluar |
 
 Setiap situs mempunyai satu **Primary**. Pada menu **3 — Add domain**, pilih
 situs, masukkan domain baru, lalu pilih **Alias** atau **Redirect**. Alias adalah
@@ -226,6 +234,13 @@ sudo wpi php-settings --memory-limit 500 --upload-max-filesize 256
 sudo wpi php-settings
 # Kembalikan kedua limit ke profil resource otomatis.
 sudo wpi php-settings --reset
+
+# Upgrade/bootstrap mengaktifkan Redis secara otomatis; dapat dijalankan ulang.
+sudo wpi optimize
+sudo wpi redis-status
+sudo wpi redis-flush example.net
+sudo wpi redis-disable example.net
+sudo wpi redis-enable example.net
 
 # Jalankan di server lama. Password diminta di terminal, bukan sebagai argumen.
 sudo wpi migrate --host 203.0.113.10 --user root
@@ -318,6 +333,9 @@ dan penanganan DNS/SSL yang masih menunggu.
 | `/var/lib/wpi/` | Metadata stack, situs, domain, dan operasi WPI. |
 | `/var/lib/wpi/credentials/` | Kredensial pemulihan situs; hanya root. |
 | `/var/lib/wpi/autotune/` | Status dan keputusan terakhir controller PHP/FPM; hanya root. |
+| `/var/lib/wpi/redis/` | Kredensial privat dan backup config cache Redis. |
+| `/etc/wpi/redis/` | Konfigurasi dan ACL instance Redis per situs. |
+| `/run/wpi-redis-ID/redis.sock` | Unix socket cache situs; tanpa port TCP. |
 | `/var/lib/wpi/ssh/known_hosts` | Pin kunci host SSH tujuan; hanya root. |
 | `/var/lib/wpi/migrations-out/` | Journal migrasi pada server sumber; tanpa password SSH. |
 | `/var/lib/wpi/migrations/` | Journal impor dan auto-SSL pada server tujuan; hanya root. |
@@ -334,12 +352,12 @@ Menjalankan bootstrap lagi mengganti aplikasi secara atomik dan mempertahankan
 data situs serta backup. Paket server dan konten WordPress dikelola terpisah
 dari pembaruan aplikasi WPI. Untuk memperbarui instalasi versi sebelumnya,
 tutup menu lama yang sedang menunggu pilihan dengan **0**, lalu jalankan ulang
-perintah instalasi v1.5.0 di atas. Tunggu operasi yang sedang berjalan selesai
+perintah instalasi v1.6.0 di atas. Tunggu operasi yang sedang berjalan selesai
 sebelum menutup panel. Pada stack WPI yang sudah
-selesai disiapkan, bootstrap otomatis mengaktifkan pengelolaan PHP/FPM tanpa
+selesai disiapkan, bootstrap otomatis mengaktifkan Redis dan pengelolaan PHP/FPM tanpa
 menginstal ulang WordPress atau meminta pengaturan tambahan.
 
-Upgrade ke v1.5.0 mempertahankan domain dan data yang sudah terpasang. Domain
+Upgrade ke v1.6.0 mempertahankan domain dan data yang sudah terpasang. Domain
 secondary versi sebelumnya tetap menjadi Redirect 301; domain tersebut tidak
 otomatis diubah menjadi Alias. Add domain baru memakai Alias secara standar.
 
@@ -348,7 +366,7 @@ otomatis diubah menjadi Alias. Add domain baru memakai Alias secara standar.
 Versi hingga v1.2.0 mengunci seluruh sesi panel, termasuk saat menunggu pilihan.
 Pesan `Panel WPI lain sedang berjalan. Tutup panel tersebut dahulu.` dapat
 muncul ketika panel lama masih terbuka di terminal atau sesi SSH lain. Tutup
-panel tersebut dengan **0** saat sudah kembali ke menu, lalu pasang v1.5.0.
+panel tersebut dengan **0** saat sudah kembali ke menu, lalu pasang v1.6.0.
 
 Mulai v1.2.1, menu, prompt, `sudo wpi list`, dan `sudo wpi status` tidak menahan
 kunci operasi. Beberapa panel dapat dibuka bersamaan; operasi yang mengubah
@@ -407,6 +425,13 @@ worker yang lebih besar dapat menghasilkan batas lebih rendah.
 Jalankan `sudo wpi status` atau pilih menu **12** untuk melihat hasil pemantauan.
 Perintah status hanya membaca informasi, bukan mengubah konfigurasi. Detail
 cara kerja dan batas kapasitas tersedia di [PHP/FPM otomatis](docs/AUTOTUNE.md).
+
+Redis mengurangi query database melalui object cache yang bertahan antar-request.
+Timer resource Redis menghitung ulang anggaran sekitar setiap 60 detik saat
+Ubuntu melihat RAM baru. Anggaran ini dibagi ke situs yang memakai cache dan
+dipertimbangkan oleh FPM agar keduanya tidak berebut seluruh memori. Redis
+object cache tidak menyimpan seluruh halaman HTML; hasilnya bergantung pada
+tema, plugin, query, dan rasio cache hit. [Detail Redis](docs/REDIS.md).
 
 Otomatisasi ini bekerja dalam RAM dan CPU server yang tersedia. Ketika CPU
 sudah penuh, menambah worker tidak mempercepat pemrosesan; controller menahan

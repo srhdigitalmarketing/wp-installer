@@ -15,15 +15,16 @@ STACK="${1:-}"
 
 # Hosted runners include an unmanaged MySQL server. Purge these known stacks
 # and their data ONLY after the disposable-VM guard above, before fresh setup.
-systemctl disable --now nginx apache2 mysql mariadb >/dev/null 2>&1 || true
+systemctl disable --now nginx apache2 mysql mariadb redis-server >/dev/null 2>&1 || true
 mapfile -t SERVER_PACKAGES < <(dpkg-query -W -f='${Package}\n' \
     'nginx*' 'apache2*' 'mysql-server*' 'mysql-client*' 'mysql-common' \
-    'mariadb-server*' 'mariadb-client*' 'mariadb-common' 'phpmyadmin' 2>/dev/null || true)
+    'mariadb-server*' 'mariadb-client*' 'mariadb-common' 'phpmyadmin' \
+    'redis-server' 'redis-tools' 2>/dev/null || true)
 if ((${#SERVER_PACKAGES[@]})); then
     DEBIAN_FRONTEND=noninteractive apt-get purge -y "${SERVER_PACKAGES[@]}"
 fi
 rm -rf -- /etc/nginx /etc/apache2 /etc/mysql /etc/phpmyadmin /etc/letsencrypt \
-    /var/lib/mysql /var/www/wpi /var/lib/wpi /var/backups/wpi /etc/wpi
+    /var/lib/mysql /var/lib/redis /etc/redis /var/www/wpi /var/lib/wpi /var/backups/wpi /etc/wpi
 
 python3 scripts/build_release.py
 WPI_VERSION="$(python3 -c 'from wpi import __version__; print(__version__)')"
@@ -290,7 +291,7 @@ def reinstall_with_idle_panel():
             chunk = os.read(panel.stdout.fileno(), 65536)
             assert chunk, 'Panel exited before displaying its menu.'
             output += chunk
-        for command in ('status', 'list', 'lock-status'):
+        for command in ('status', 'list', 'lock-status', 'redis-status'):
             subprocess.run(['/usr/local/bin/wpi', command], check=True,
                            text=True, capture_output=True, timeout=20)
         subprocess.run(['bash', 'install.sh', '--bundle', os.environ['WPI_CI_BUNDLE'],
@@ -305,6 +306,117 @@ def reinstall_with_idle_panel():
     assert panel.returncode == 0, 'Idle panel did not close normally.'
     print('Real installed idle panel allowed status, list, and bootstrap upgrade; '
           'panel closed normally with option 0.', flush=True)
+
+
+def cache_probe(site, key, expected=None):
+    """A new real WP-CLI process reports only hit and value-match booleans."""
+    script = "$found=false; $value=wp_cache_get(" + json.dumps(key) + ", 'wpi_ci', false, $found); "
+    script += "echo json_encode(['persistent'=>wp_using_ext_object_cache(), 'found'=>$found, "
+    script += "'matches'=>$value === " + json.dumps(expected) + "]);"
+    return json.loads(manager.wp(site, 'eval', script).stdout)
+
+
+def verify_redis_cache(site):
+    """Real plugin/Redis persistence, SQL reduction, isolation, and explicit recovery."""
+    site = manager.site(site['id'])
+    assert site['redis_cache']['enabled'], 'Fresh WordPress did not enable Redis automatically.'
+    assert manager.wp(site, 'plugin', 'get', 'redis-cache', '--field=version').stdout.strip() == '3.0.0'
+    assert manager.wp(site, 'eval', "echo wp_using_ext_object_cache() ? 'yes' : 'no';").stdout == 'yes'
+    manager.wp(site, 'cache', 'set', 'wpi-cross-process', 'process-persistence', 'wpi_ci')
+    assert cache_probe(site, 'wpi-cross-process', 'process-persistence') == {
+        'persistent': True, 'found': True, 'matches': True}
+
+    # A separate PHP-FPM request must see the key created by WP-CLI rather
+    # than only its own process-local WordPress cache.
+    probe = Path(site['root']) / 'wpi-ci-redis.php'
+    probe.write_text("<?php require __DIR__ . '/wp-load.php'; header('Content-Type: application/json'); "
+                     "$found=false; $v=wp_cache_get('wpi-cross-process','wpi_ci',false,$found); "
+                     "echo json_encode(['persistent'=>wp_using_ext_object_cache(), "
+                     "'found'=>$found,'matches'=>$v === 'process-persistence']);")
+    probe.chmod(0o644)
+    try:
+        status, _, body, code = expected_request(site['primary'], 200, path='/wpi-ci-redis.php')
+        assert status == 200 and code == 0
+        assert json.loads(body) == {'persistent': True, 'found': True, 'matches': True}
+
+        peer, _ = manager.install('wpi-cache-peer.example.com', 'owner@example.com',
+                                  admin='cachepeer', password='CiPeerWordPressPassword123!')
+        peer = manager.site(peer['id'])
+        assert peer['redis_cache']['enabled']
+        assert peer['redis_cache']['socket'] != site['redis_cache']['socket']
+        manager.wp(peer, 'cache', 'set', 'wpi-peer-sentinel', 'keep-peer-cache', 'wpi_ci')
+        subprocess.run(['/usr/local/bin/wpi', 'redis-flush', site['id']],
+                       check=True, capture_output=True, text=True)
+        assert cache_probe(site, 'wpi-cross-process')['found'] is False
+        assert cache_probe(peer, 'wpi-peer-sentinel', 'keep-peer-cache')['matches'] is True
+
+        # Twenty deliberately non-autoloaded options isolate query savings
+        # from changing startup queries and shared-runner response timings.
+        manager.wp(site, 'eval', "for ($i=0;$i<20;$i++) { add_option('wpi_ci_nonautoload_'.$i, "
+                   "'fixture-'.$i, '', false); }")
+        subprocess.run(['/usr/local/bin/wpi', 'redis-flush', site['id']],
+                       check=True, capture_output=True, text=True)
+        query_script = ("global $wpdb; $start=$wpdb->num_queries; $ok=true; "
+                        "for ($i=0;$i<20;$i++) { $ok=$ok && "
+                        "get_option('wpi_ci_nonautoload_'.$i) === 'fixture-'.$i; } "
+                        "echo json_encode(['queries'=>$wpdb->num_queries-$start,'values_ok'=>$ok]);")
+        cold = json.loads(manager.wp(site, 'eval', query_script).stdout)
+        warm = json.loads(manager.wp(site, 'eval', query_script).stdout)
+        assert cold['values_ok'] and warm['values_ok']
+        assert cold['queries'] >= 20 and warm['queries'] == 0, (cold['queries'], warm['queries'])
+
+        for current in (site, peer):
+            socket = Path(current['redis_cache']['socket'])
+            assert socket.is_socket(), 'Managed Redis UNIX socket is missing.'
+            conf = (Path('/etc/wpi/redis') / (current['id'] + '.conf')).read_text()
+            assert re.search(r'^port 0$', conf, re.M)
+            assert re.search(r'^maxmemory-policy allkeys-lfu$', conf, re.M)
+            credentials = manager.data / 'redis/credentials' / (current['id'] + '.json')
+            assert credentials.stat().st_mode & 0o777 == 0o600
+            assert manager.wp(current, 'eval',
+                              "echo ((defined('WP_REDIS_GRACEFUL') && WP_REDIS_GRACEFUL) || "
+                              "(defined('WP_REDIS_SELECTIVE_FLUSH') && WP_REDIS_SELECTIVE_FLUSH)) "
+                              "? 'unsupported' : 'supported';").stdout == 'supported'
+        listeners = subprocess.run(['ss', '-ltnp'], check=True, capture_output=True, text=True).stdout
+        assert 'redis-server' not in listeners, 'Redis opened a TCP listener.'
+
+        # Upstream Redis Object Cache reports connection failures. Diagnosis
+        # and the resource timer must not silently reactivate a stopped service.
+        unit = 'wpi-redis@' + site['id'] + '.service'
+        subprocess.run(['systemctl', 'stop', unit], check=True)
+        assert expected_request(site['primary'], 500)[0] == 500, 'Redis outage was not visible over HTTP.'
+        diagnosis = manager.repair_site(site['id'], check_only=True)
+        assert diagnosis['status'] == 'unresolved'
+        subprocess.run(['/usr/local/bin/wpi', 'redis-status'], check=True, capture_output=True, text=True)
+        subprocess.run(['/usr/local/bin/wpi', 'performance-tick'], check=True, capture_output=True, text=True)
+        assert subprocess.run(['systemctl', 'is-active', '--quiet', unit]).returncode != 0
+        assert expected_request(peer['primary'], 200)[0] == 200, 'One Redis outage affected another instance.'
+        recovered = manager.repair_site(site['id'])
+        assert recovered['status'] == 'resolved'
+        assert expected_request(site['primary'], 200)[0] == 200
+        assert manager.wp(site, 'eval', "echo wp_using_ext_object_cache() ? 'yes' : 'no';").stdout == 'yes'
+        manager.wp(site, 'cache', 'set', 'wpi-cross-process', 'process-persistence', 'wpi_ci')
+        assert cache_probe(site, 'wpi-cross-process', 'process-persistence')['matches'] is True
+        assert cache_probe(peer, 'wpi-peer-sentinel', 'keep-peer-cache')['matches'] is True
+
+        # The user can disable cache, and optimize must respect that choice.
+        subprocess.run(['/usr/local/bin/wpi', 'redis-disable', site['id']],
+                       check=True, capture_output=True, text=True)
+        subprocess.run(['/usr/local/bin/wpi', 'optimize'], check=True, capture_output=True, text=True)
+        assert manager.site(site['id'])['redis_cache']['enabled'] is False
+        assert expected_request(site['primary'], 200)[0] == 200
+        subprocess.run(['/usr/local/bin/wpi', 'redis-enable', site['id']],
+                       check=True, capture_output=True, text=True)
+        assert manager.site(site['id'])['redis_cache']['enabled'] is True
+        manager.wp(site, 'cache', 'set', 'wpi-cross-process', 'process-persistence', 'wpi_ci')
+        assert cache_probe(site, 'wpi-cross-process', 'process-persistence')['matches'] is True
+        print(f'Real Redis Object Cache 3.0.0: WP-CLI/PHP persistence; '
+              f'20 option reads SQL cold={cold["queries"]}, warm={warm["queries"]}; '
+              'two-site flush isolation, UNIX-only listeners, visible outage and explicit repair recovery; '
+              'disable respected by optimize.', flush=True)
+        return peer
+    finally:
+        probe.unlink(missing_ok=True)
 
 
 def verify_runcloud_domains(site, post):
@@ -469,6 +581,7 @@ with mock.patch.object(core, 'check_dns', return_value=None), \
     assert request(old, autotune.STATUS_PATH)[0] == 403
     verify_redirect(old, old, https=False)
     verify_real_fpm_congestion(site)
+    cache_peer = verify_redis_cache(site)
     verify_repair_and_php_settings(site)
 
     # A PHP array option is stored serialized by WordPress. The replacement
@@ -519,6 +632,12 @@ with mock.patch.object(core, 'check_dns', return_value=None), \
     assert manager.wp(restored, 'option', 'get', 'siteurl').stdout.strip() == 'https://' + old
     assert expected_request(old, 200)[0] == 200
     restored = verify_runcloud_domains(restored, post)
+    assert manager.wp(restored, 'eval', "echo wp_using_ext_object_cache() ? 'yes' : 'no';").stdout == 'yes'
+    manager.wp(restored, 'cache', 'set', 'wpi-after-restore', 'restore-persistence', 'wpi_ci')
+    assert cache_probe(restored, 'wpi-after-restore', 'restore-persistence')['matches'] is True
+    assert cache_probe(cache_peer, 'wpi-peer-sentinel', 'keep-peer-cache')['matches'] is True
+    print('Redis remained usable after backup restore, URL replacement, and Alias promotion; '
+          'the other site cache was retained.', flush=True)
 
     tables_before = manager.wp(restored, 'db', 'tables', '--all-tables-with-prefix').stdout
     manager.install_pma(pma, 'owner@example.com', password='CiPanelPassword123!')

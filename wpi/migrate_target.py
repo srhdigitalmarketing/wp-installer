@@ -531,6 +531,15 @@ class TargetMigration:
                 from .autotune import detect_resources, profile
                 from .php_settings import configured_profile
                 resources = detect_resources()
+                # Target setup enables Redis. Reserve its intended footprint
+                # before approving source PHP overrides on smaller hardware.
+                from .redis_cache import redis_resource_profile
+                cache_count = sum(site.get('redis_cache', {}).get('enabled') is not False
+                                  for site in metadata['sites'])
+                resources['redis_cache'] = {
+                    'enabled': True,
+                    **redis_resource_profile(resources['memory_total'], max(1, cache_count)),
+                }
                 configured_profile(profile(resources), settings, resources, check_capacity=True)
             self.manager.setup(metadata['source_config']['stack'], metadata['source_config']['database'])
             if not journal:
@@ -574,6 +583,7 @@ class TargetMigration:
                                     input=credentials['database_password'] + '\n')
                     self.manager.runner(['chmod', '640', str(Path(site['root']) / 'wp-config.php')])
                     self.manager._site_memory_settings(site)
+                    self.manager._site_cache_config(site)
                     backup = self.manager.backups / ident / ('migration-' + migration_id)
                     _safe_directory(backup)
                     if backup.exists():
@@ -584,6 +594,9 @@ class TargetMigration:
                         backup.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                         shutil.copytree(folder, backup)
                     self.manager.restore_database(site, backup)
+                    if self.manager.config.get('redis_cache', {}).get('enabled') \
+                            and site.get('redis_cache', {}).get('enabled'):
+                        self.manager.redis_flush(ident)
                     self.manager.wp(site, 'core', 'is-installed')
                     for host in site_hosts(site):
                         if self._install_certificate(host, extracted / 'certs' / host) or self.manager.web.letsencrypt_ready(host):
@@ -593,6 +606,7 @@ class TargetMigration:
                     self._frontend_health(site)
                     site['status'] = 'active'
                     self.manager.save_site(site)
+                    self.manager._enable_site_cache(ident)
                     self.manager.remember_config(ident)
                     progress['status'] = 'complete'
                     self._save(journal)

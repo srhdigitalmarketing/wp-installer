@@ -141,7 +141,20 @@ class Manager:
     def repair_site(self, identifier, check_only=False):
         from .repair import SiteRepair
         repair = SiteRepair(self)
-        return repair.diagnose(identifier) if check_only else repair.repair(identifier)
+        cache_started = False
+        if not check_only and self.site(identifier).get('redis_cache', {}).get('enabled'):
+            # Start only this managed cache, before WordPress needs it. Config
+            # recovery below also refreshes its local credential overlay.
+            service = self.redis.service(self.site(identifier)['id'])
+            cache_started = self.runner(['systemctl', 'is-active', '--quiet', service],
+                                        check=False).returncode != 0
+            self.redis.start_site(identifier)
+        report = repair.diagnose(identifier) if check_only else repair.repair(identifier)
+        if cache_started:
+            report.setdefault('actions', []).append({'redis': 'started'})
+            if report['status'] == 'healthy':
+                report['status'] = 'resolved'
+        return report
 
     def php_settings_status(self):
         from .php_settings import PHPSettings
@@ -151,6 +164,93 @@ class Manager:
         from .php_settings import PHPSettings
         settings = PHPSettings(self)
         return settings.reset() if reset else settings.apply(memory_limit, upload_max_filesize)
+
+    @property
+    def redis(self):
+        from .redis_cache import RedisCache
+        return RedisCache(self)
+
+    def enable_redis(self, identifier=None):
+        if self.config.get('php_settings'):
+            from .autotune import detect_resources, profile
+            from .php_settings import configured_profile
+            from .redis_cache import redis_resource_profile
+            resources = detect_resources()
+            candidates = {site['id'] for site in self.sites() if
+                          site.get('redis_cache', {}).get('enabled') or
+                          (identifier is None and site['status'] == 'active' and
+                           site.get('redis_cache', {}).get('enabled') is not False)}
+            if identifier is not None:
+                candidates.add(self.site(identifier)['id'])
+            resources['redis_cache'] = redis_resource_profile(
+                resources['memory_total'], max(1, len(candidates)))
+            configured_profile(profile(resources), self.config['php_settings'],
+                               resources, check_capacity=True)
+        self.redis.install()
+        if identifier is not None:
+            return self.redis.enable_site(identifier)
+        reports = []
+        for site in self.sites():
+            if site['status'] != 'active' or site.get('redis_cache', {}).get('enabled') is False:
+                continue
+            reports.append(self.redis.enable_site(site['id']))
+        return {'server': self.redis.status(), 'sites': reports}
+
+    def redis_status(self):
+        return self.redis.status()
+
+    def redis_flush(self, identifier):
+        return self.redis.flush_site(identifier)
+
+    def redis_disable(self, identifier):
+        return self.redis.disable_site(identifier)
+
+    def _site_cache_config(self, site):
+        if self.config.get('redis_cache', {}).get('enabled') \
+                and site.get('redis_cache', {}).get('enabled'):
+            self.redis.prepare_site_config(site['id'])
+
+    def _enable_site_cache(self, identifier):
+        if self.config.get('redis_cache', {}).get('enabled'):
+            site = self.site(identifier)
+            if site.get('redis_cache', {}).get('enabled') is not False:
+                return self.redis.enable_site(identifier)
+
+    def optimize(self):
+        if not self.config or not self.config.get('setup_complete', True):
+            return {'enabled': False, 'reason': 'Menunggu setup server selesai.'}
+        redis = self.enable_redis()
+        tuning = self.enable_autotune()
+        self._install_performance_timer()
+        return {'enabled': True, 'redis': redis, 'php': tuning}
+
+    def performance_tick(self):
+        if not self.config.get('setup_complete', True) \
+                or not self.config.get('redis_cache', {}).get('enabled'):
+            return {'enabled': False}
+        # Adjust resource limits only. A stopped cache is handled by Repair.
+        return self.redis.optimize()
+
+    def _install_performance_timer(self):
+        units = Path('/etc/systemd/system')
+        files = {
+            'wpi-performance.service': '[Unit]\nDescription=WPI Redis resource optimization\n'
+                'After=network.target\n[Service]\nType=oneshot\n'
+                'ExecStart=/usr/local/bin/wpi performance-tick\nUMask=0077\n'
+                'Nice=10\nNoNewPrivileges=true\n',
+            'wpi-performance.timer': '[Unit]\nDescription=WPI Redis resource updates\n'
+                '[Timer]\nOnBootSec=90s\nOnUnitActiveSec=60s\nAccuracySec=10s\n'
+                '[Install]\nWantedBy=timers.target\n',
+        }
+        for name, contents in files.items():
+            target = units / name
+            if target.is_symlink() or target.exists() and not target.read_text().startswith(
+                    '[Unit]\nDescription=WPI Redis resource'):
+                raise ValueError('Unit optimasi Redis sudah dipakai aplikasi lain.')
+            if not target.exists() or target.read_text() != contents:
+                WebStack._atomic_file(target, contents.encode(), 0o644)
+        self.runner(['systemctl', 'daemon-reload'])
+        self.runner(['systemctl', 'enable', '--now', 'wpi-performance.timer'])
 
     def sites(self):
         return [json.loads(p.read_text()) for p in sorted((self.data / 'sites').glob('*.json'))]
@@ -195,7 +295,9 @@ class Manager:
             if (self.config['stack'], self.config['database']) != (stack, database):
                 raise ValueError('Stack server sudah ditetapkan. Gunakan pilihan yang sama.')
             if self.config.get('setup_complete', True):
-                if not self.config.get('autotune_enabled'):
+                if not self.config.get('redis_cache', {}).get('enabled'):
+                    self.optimize()
+                elif not self.config.get('autotune_enabled'):
                     self.enable_autotune()
                 return self.config
         release = dict(line.strip().split('=', 1) for line in Path('/etc/os-release').read_text().splitlines()
@@ -238,6 +340,8 @@ class Manager:
         db_conf.write_text('[mysqld]\nbind-address = 127.0.0.1\n', encoding='utf-8')
         self.runner(['systemctl', 'restart', db_service])
         self.runner(['systemctl', 'enable', '--now', db_service, f'php{php}-fpm'])
+        self.redis.install()
+        cfg = self.config
         # Resource profiles and the running controller configure PHP/FPM without
         # asking the user to enter process counts or PHP memory limits.
         AutoTuner(php, self.runner, data_dir=self.data).install()
@@ -268,6 +372,7 @@ class Manager:
         cfg['setup_complete'] = True
         cfg['autotune_enabled'] = True
         atomic_json(self.data / 'config.json', cfg)
+        self._install_performance_timer()
         return cfg
 
     def enable_autotune(self):
@@ -365,6 +470,8 @@ class Manager:
             atomic_json(self.data / 'credentials' / (ident + '.json'),
                         {'wordpress_admin': admin, 'wordpress_password': password,
                          'database_user': site['db_user'], 'database_password': dbpass})
+            self._enable_site_cache(ident)
+            site = self.site(ident)
             self.remember_config(ident)
             return site, password
         except BaseException:
@@ -379,6 +486,7 @@ class Manager:
         site = self.site(identifier)
         site['status'] = 'active'
         self.save_site(site)
+        self._enable_site_cache(identifier)
         self.remember_config(identifier)
 
     def resume_install(self, identifier):
@@ -409,6 +517,7 @@ class Manager:
             self.wp(site, 'config', 'create', f'--dbname={site["db_name"]}', f'--dbuser={site["db_user"]}',
                     '--dbhost=localhost', f'--dbprefix=wp_{site["id"][:6]}_', '--prompt=dbpass', input=dbpass + '\n')
         self.runner(['chmod', '640', str(Path(site['root']) / 'wp-config.php')])
+        self._site_cache_config(site)
         installed = self.wp(site, 'core', 'is-installed', check=False)
         if installed.returncode:
             self.wp(site, 'core', 'install', f'--url=https://{site["primary"]}',
@@ -646,6 +755,10 @@ class Manager:
         old = json.loads((folder / 'site.json').read_text())
         if old['root'] != current['root'] or old['id'] != current['id']:
             raise ValueError('Lokasi/identitas backup tidak cocok.')
+        # Cache belongs to this server's runtime, not the restored content.
+        # Preserve local opt-out and instance credentials across snapshots.
+        if 'redis_cache' in current:
+            old['redis_cache'] = copy.deepcopy(current['redis_cache'])
         restore_credentials = None
         if current.get('migration_id'):
             # Imported snapshots retain the source's wp-config and manifest.
@@ -709,6 +822,7 @@ class Manager:
                 self.wp(old, 'config', 'set', 'DB_PASSWORD', '--prompt',
                         input=restore_credentials['database_password'] + '\n')
                 self.runner(['chmod', '640', str(root / 'wp-config.php')])
+            self._site_cache_config(old)
             self.restore_database(old, folder)
             old['tls'] = [h for h in site_hosts(old) if self.web.certificate_ready(h)]
             self.web.write_site(old)
@@ -730,8 +844,9 @@ class Manager:
             if staged.exists():
                 shutil.rmtree(staged)
         self._site_memory_settings(old)
+        self._enable_site_cache(identifier)
         self.remember_config(identifier)
-        return old, safety
+        return self.site(identifier), safety
 
     def renew_ssl(self, identifier):
         site = self.site(identifier)

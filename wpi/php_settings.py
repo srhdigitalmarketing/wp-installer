@@ -73,13 +73,11 @@ def configured_profile(default, settings, resources, *, check_capacity=False):
         total = resources.get('memory_total', 0)
         if total <= 0 or not resources.get('telemetry_ok'):
             raise RuntimeError('Kapasitas RAM belum dapat dibaca; pengaturan PHP tidak diubah.')
-        reserve = max(384 * autotune.MIB, int(total * 0.35))
-        opcache = result['opcache_mib'] * autotune.MIB
-        budget = max(0, min(int(total * 0.50), total - reserve - opcache))
+        budget = autotune.memory_reservations(resources, result['opcache_mib'])['memory_budget']
         maximum = max(0, budget // autotune.MIB - 32)
         if 'memory_limit_mb' in settings and result['memory_mib'] > maximum:
             raise ValueError(f'PHP memory limit melebihi anggaran RAM server. '
-                             f'Maksimal saat ini {maximum} MiB setelah cadangan OS/database/OPcache.')
+                             f'Maksimal saat ini {maximum} MiB setelah cadangan OS/database/Redis/OPcache.')
     return result
 
 
@@ -135,6 +133,7 @@ class PHPSettings:
         return {'scope': 'server', 'manual': manual, 'effective': effective,
                 'web_body_mib': self.web_body_mib(effective, manual),
                 'memory_total_mib': resources.get('memory_total', 0) // autotune.MIB,
+                'redis_cache': autotune.redis_resource_report(resources),
                 'capacity': autotune.capacity(bounded)['capacity'],
                 'sites': [site['primary'] for site in self.manager.sites()]}
 

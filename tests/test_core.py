@@ -666,7 +666,7 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(self.commands, [])
 
     def test_existing_setup_automatically_migrates_php_fpm(self):
-        with mock.patch.object(self.manager, 'enable_autotune') as enable:
+        with mock.patch.object(self.manager, 'optimize') as enable:
             self.manager.setup('nginx', 'mariadb')
         enable.assert_called_once_with()
 
