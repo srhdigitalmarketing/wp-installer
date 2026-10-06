@@ -1,5 +1,6 @@
 """Redis resource budgets, isolation, authenticated activation and recovery."""
 import hashlib
+import fnmatch
 import io
 import json
 from pathlib import Path
@@ -47,16 +48,49 @@ class FakeClient:
             backend.cache._paths(identifier)['credentials'], 'wpi_' + identifier)
         if expected['password'] != password or identifier not in backend.active:
             raise RedisProtocolError('Auth failed')
+        self.closed = False
+        backend.clients.append(self)
 
     def __enter__(self):
         return self
 
     def __exit__(self, *args):
-        return None
+        self.closed = True
 
     def command(self, *args):
+        if self.closed:
+            raise RedisProtocolError('Connection closed')
         self.backend.commands.append((self.identifier, args))
-        command = args[0]
+        command = args[0].upper()
+        if self.username != 'wpi_admin':
+            tokens = self.state['acl_users'][self.username]
+            if '+' + command.lower() not in tokens:
+                raise RedisProtocolError('NOPERM command denied')
+            if command in ('GET', 'SET', 'ZADD', 'ZRANGEBYSCORE', 'ZREMRANGEBYSCORE', 'ZCOUNT'):
+                patterns = [token[1:] for token in tokens if token.startswith('~')]
+                if not any(fnmatch.fnmatchcase(args[1], pattern) for pattern in patterns):
+                    raise RedisProtocolError('NOPERM key denied')
+        if command == 'GET':
+            return self.state['keys'].get(args[1])
+        if command == 'SET':
+            self.state['keys'][args[1]] = args[2]
+            return 'OK'
+        if command in ('ZADD', 'ZRANGEBYSCORE', 'ZREMRANGEBYSCORE', 'ZCOUNT'):
+            values = self.state.setdefault('sorted_sets', {}).setdefault(args[1], {})
+            if command == 'ZADD':
+                fresh = args[3] not in values
+                values[args[3]] = float(args[2])
+                return int(fresh)
+            selected = sorted(((member, score) for member, score in values.items()
+                               if float(args[2]) <= score <= float(args[3])), key=lambda item: item[1])
+            if command == 'ZREMRANGEBYSCORE':
+                for member, _ in selected:
+                    del values[member]
+                return len(selected)
+            if command == 'ZCOUNT':
+                return len(selected)
+            return [part for item in selected for part in item] if 'WITHSCORES' in args else \
+                [member for member, _ in selected]
         if command == 'CONFIG' and args[1] == 'GET':
             return ['maxmemory', str(self.state['limit'])]
         if command == 'CONFIG' and args[1] == 'SET':
@@ -67,9 +101,20 @@ class FakeClient:
                 self.state['limit'] = int(args[3])
             return 'OK'
         if command == 'ACL':
+            if args[1] == 'LOAD':
+                self.backend.load_acl(self.identifier)
+                # Redis 6 frees all named users and closes their existing clients.
+                for client in self.backend.clients:
+                    if client.identifier == self.identifier:
+                        client.closed = True
+            elif args[1] == 'SETUSER':
+                if args[3] != 'reset':
+                    raise AssertionError('Targeted ACL update must replace all rules.')
+                self.state['acl_users'][args[2]] = list(args[4:])
             return 'OK'
         if command == 'FLUSHDB':
             self.state['keys'].clear()
+            self.state.setdefault('sorted_sets', {}).clear()
             return 'OK'
         if command == 'FLUSHALL' and self.username != 'wpi_admin':
             raise RedisProtocolError('Forbidden')
@@ -89,6 +134,7 @@ class Backend:
         self.calls, self.wp_calls, self.commands = [], [], []
         self.active, self.plugins_active = set(), set()
         self.instances, self.memory = {}, 32 * GIB
+        self.clients = []
         self.installed_packages = {'redis-server', 'redis-tools', 'php8.3-redis'}
         self.stock_service_exists, self.fail_resize, self.fail_health = False, False, False
         self.config_name_field = 'name'
@@ -110,11 +156,17 @@ class Backend:
             config = self.cache._paths(identifier)['config'].read_text()
             limit = int(re.search(r'^maxmemory (\d+)$', config, re.M)[1])
             self.instances.setdefault(identifier, {'keys': {}})['limit'] = limit
+            self.load_acl(identifier)
         elif argv[:2] == ['systemctl', 'start']:
             self.active.add(self.identifier(argv[-1]))
         elif argv[:2] == ['systemctl', 'disable']:
             self.active.discard(self.identifier(argv[-1]))
         return subprocess.CompletedProcess(argv, rc, out, '')
+
+    def load_acl(self, identifier):
+        acl = self.cache._paths(identifier)['acl'].read_text()
+        self.instances[identifier]['acl_users'] = {row[1]: row[2:] for line in acl.splitlines()
+                                                   if (row := line.split())}
 
     @staticmethod
     def identifier(service):
@@ -257,6 +309,56 @@ class ActivationTests(unittest.TestCase):
         self.assertFalse((Path(self.manager.site(self.a)['root']) / 'wp-content/object-cache.php').exists())
         self.assertIn('sentinel', self.backend.instances[self.b]['keys'])
 
+    def test_metrics_acl_upgrade_allows_collection_and_pruning_without_admin_or_peer_access(self):
+        self.cache.enable_site(self.a)
+        self.cache.enable_site(self.b)
+        metric_key = f'wpi:{self.a}:wp_:redis-cache:metrics'
+        peer_key = f'wpi:{self.b}:wp_:redis-cache:metrics'
+        self.backend.instances[self.a]['keys']['sentinel'] = 'keep A'
+        self.backend.instances[self.b]['keys']['sentinel'] = 'keep B'
+        credentials = {identifier: hashlib.sha256(self.cache._paths(identifier)[
+            'credentials'].read_bytes()).hexdigest() for identifier in (self.a, self.b)}
+        acl_path = self.cache._paths(self.a)['acl']
+        old_acl = acl_path.read_text()
+        for command in ('zadd', 'zrangebyscore', 'zremrangebyscore', 'zcount'):
+            old_acl = old_acl.replace(' +' + command, '')
+        acl_path.write_bytes(old_acl.encode())
+        self.backend.load_acl(self.a)
+        with self.cache._client(self.a, admin=False) as client:
+            with self.assertRaisesRegex(RedisProtocolError, 'NOPERM'):
+                client.command('ZADD', metric_key, 100, 'first')
+
+        self.backend.calls.clear()
+        self.backend.commands.clear()
+        self.assertTrue(self.cache.optimize()['changed'])
+        self.assertTrue(any(identifier == self.a and args[:3] ==
+                            ('ACL', 'SETUSER', 'wpi_' + self.a)
+                            for identifier, args in self.backend.commands))
+        self.assertFalse(any(call[:2] in (['systemctl', 'start'], ['systemctl', 'restart'],
+                                         ['systemctl', 'enable']) for call in self.backend.calls))
+        with self.cache._client(self.a, admin=False) as client:
+            self.assertEqual(client.command('ZADD', metric_key, 100, 'first'), 1)
+            self.assertEqual(client.command('ZADD', metric_key, 160, 'second'), 1)
+            self.assertEqual(client.command('ZRANGEBYSCORE', metric_key, '-inf', '+inf',
+                                            'WITHSCORES'), ['first', 100.0, 'second', 160.0])
+            self.assertEqual(client.command('ZCOUNT', metric_key, '-inf', '+inf'), 2)
+            self.assertEqual(client.command('ZREMRANGEBYSCORE', metric_key, 0, 100), 1)
+            self.assertEqual(client.command('ZCOUNT', metric_key, '-inf', '+inf'), 1)
+            for command in (('ZADD', peer_key, 100, 'foreign'),
+                            ('ZRANGEBYSCORE', peer_key, '-inf', '+inf'),
+                            ('ZCOUNT', peer_key, '-inf', '+inf'),
+                            ('ZREMRANGEBYSCORE', peer_key, 0, 100),
+                            ('FLUSHALL',), ('EVAL', 'return 1', 0),
+                            ('CONFIG', 'SET', 'maxmemory', 1), ('ACL', 'LOAD')):
+                with self.subTest(command=command[0]), self.assertRaisesRegex(
+                        RedisProtocolError, 'NOPERM'):
+                    client.command(*command)
+        for identifier in (self.a, self.b):
+            self.assertEqual(hashlib.sha256(self.cache._paths(identifier)[
+                'credentials'].read_bytes()).hexdigest(), credentials[identifier])
+            self.assertIn('sentinel', self.backend.instances[identifier]['keys'])
+        self.assertFalse(self.cache.optimize()['changed'])
+
     def test_foreign_dropin_is_rejected_before_any_mutation(self):
         target = Path(self.manager.site(self.a)['root']) / 'wp-content/object-cache.php'
         target.write_bytes(b'<?php // another cache')
@@ -280,6 +382,53 @@ class ActivationTests(unittest.TestCase):
         originals = list((self.data / 'redis/backups').glob('*/wp-config.php'))
         self.assertTrue(originals)
         self.assertEqual(originals[0].read_bytes(), snapshots[Path(site['root']) / 'wp-config.php'][0])
+
+    def test_held_app_and_admin_connections_survive_combined_acl_and_memory_upgrade(self):
+        self._held_upgrade(fail=False)
+
+    def test_failed_combined_upgrade_restores_live_acl_and_quota_without_disconnecting_clients(self):
+        self._held_upgrade(fail=True)
+
+    def _held_upgrade(self, fail):
+        self.cache.enable_site(self.a)
+        acl_path = self.cache._paths(self.a)['acl']
+        old_acl = acl_path.read_text()
+        for command in ('zadd', 'zrangebyscore', 'zremrangebyscore', 'zcount'):
+            old_acl = old_acl.replace(' +' + command, '')
+        acl_path.write_bytes(old_acl.encode())
+        self.backend.load_acl(self.a)
+        self.backend.memory = 128 * GIB
+        self.backend.fail_resize = fail
+        old_limit = self.backend.instances[self.a]['limit']
+        protected = {name: tokens.copy() for name, tokens in self.backend.instances[
+            self.a]['acl_users'].items() if name in ('default', 'wpi_admin')}
+        key = f'wpi:{self.a}:test:sentinel'
+        metric_key = f'wpi:{self.a}:wp_:redis-cache:metrics'
+        with self.cache._client(self.a, admin=False) as app, self.cache._client(self.a) as admin:
+            self.assertEqual(app.command('SET', key, 'keep'), 'OK')
+            with self.assertRaisesRegex(RedisProtocolError, 'NOPERM'):
+                app.command('ZADD', metric_key, 100, 'sample')
+            self.backend.commands.clear()
+            if fail:
+                with self.assertRaises(RedisProtocolError):
+                    self.cache.optimize()
+                self.assertEqual(acl_path.read_bytes(), old_acl.encode())
+                self.assertEqual(admin.command('CONFIG', 'GET', 'maxmemory')[1], str(old_limit))
+                with self.assertRaisesRegex(RedisProtocolError, 'NOPERM'):
+                    app.command('ZADD', metric_key, 100, 'sample')
+            else:
+                self.assertTrue(self.cache.optimize()['changed'])
+                self.assertGreater(int(admin.command('CONFIG', 'GET', 'maxmemory')[1]), old_limit)
+                self.assertEqual(app.command('ZADD', metric_key, 100, 'sample'), 1)
+            self.assertEqual(app.command('PING'), 'PONG')
+            self.assertEqual(app.command('GET', key), 'keep')
+            self.assertEqual(admin.command('PING'), 'PONG')
+            self.assertFalse(any(args[:2] == ('ACL', 'LOAD') for _, args in self.backend.commands))
+            updates = [args for _, args in self.backend.commands if args[:2] == ('ACL', 'SETUSER')]
+            self.assertTrue(updates)
+            self.assertTrue(all(args[2:5] == ('wpi_' + self.a, 'reset', 'on') for args in updates))
+        for name, tokens in protected.items():
+            self.assertEqual(self.backend.instances[self.a]['acl_users'][name], tokens)
 
     def test_repeat_enable_preserves_exact_config_and_backup_set(self):
         self.cache.enable_site(self.a)

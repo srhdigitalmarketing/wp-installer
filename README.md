@@ -28,6 +28,9 @@ panduan terbaru di bawah; perilakunya berbeda dari rekaman lama.
   memakai eviction `allkeys-lfu`, dan dihitung bersama kapasitas PHP-FPM.
   **Menu 18** mengoptimalkan Redis/PHP dan **menu 19** mengelola cache situs.
   [Panduan Redis dan optimasi](docs/REDIS.md).
+  v1.6.1 memperbaiki izin Metrics plugin yang belum lengkap pada v1.6.0;
+  upgrade mempertahankan kredensial dan cache. Grafik membutuhkan request
+  WordPress pada beberapa menit sebelum data ditampilkan.
 - **Add domain**: pilih **Alias** untuk membuka situs WordPress yang sama pada
   domain tambahan, atau **Redirect** untuk pengalihan permanen **301** ke primary.
   Untuk domain tanpa www, pilihan **www** menambahkan hostname www juga.
@@ -93,12 +96,12 @@ sudo apt-get update
 sudo apt-get install -y curl ca-certificates
 
 curl -fL --proto '=https' --proto-redir '=https' \
-  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.6.0/install.sh \
+  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.6.1/install.sh \
   -o install.sh
 curl -fL --proto '=https' --proto-redir '=https' \
-  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.6.0/install.sh.sha256 \
+  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.6.1/install.sh.sha256 \
   -o install.sh.sha256
-sha256sum --check install.sh.sha256 && sudo bash install.sh --version v1.6.0
+sha256sum --check install.sh.sha256 && sudo bash install.sh --version v1.6.1
 
 sudo wpi
 ```
@@ -111,25 +114,25 @@ percaya atau tinjau kode pada tag versi tersebut.
 
 ### Memakai bundle lokal
 
-Unduh `wp-installer-v1.6.0.zip` dan `wp-installer-v1.6.0.zip.sha256`
-dari [release v1.6.0](https://github.com/srhdigitalmarketing/wp-installer/releases/tag/v1.6.0),
+Unduh `wp-installer-v1.6.1.zip` dan `wp-installer-v1.6.1.zip.sha256`
+dari [release v1.6.1](https://github.com/srhdigitalmarketing/wp-installer/releases/tag/v1.6.1),
 lalu salin ke server bersama `install.sh`.
 
 ```bash
-sudo bash install.sh --bundle ./wp-installer-v1.6.0.zip
+sudo bash install.sh --bundle ./wp-installer-v1.6.1.zip
 sudo wpi
 ```
 
 Hash yang diperoleh secara terpisah juga dapat diberikan melalui `--sha256`:
 
 ```bash
-sudo bash install.sh --bundle ./wp-installer-v1.6.0.zip --sha256 HASH_SHA256_RILIS
+sudo bash install.sh --bundle ./wp-installer-v1.6.1.zip --sha256 HASH_SHA256_RILIS
 ```
 
 Validasi bundle tanpa pemasangan, tanpa akses root, dan tanpa jaringan:
 
 ```bash
-bash install.sh --bundle ./wp-installer-v1.6.0.zip --check-only
+bash install.sh --bundle ./wp-installer-v1.6.1.zip --check-only
 ```
 
 Mode ini memerlukan Bash dan Python 3.10+. SHA256, keamanan path ZIP, kelengkapan
@@ -352,12 +355,12 @@ Menjalankan bootstrap lagi mengganti aplikasi secara atomik dan mempertahankan
 data situs serta backup. Paket server dan konten WordPress dikelola terpisah
 dari pembaruan aplikasi WPI. Untuk memperbarui instalasi versi sebelumnya,
 tutup menu lama yang sedang menunggu pilihan dengan **0**, lalu jalankan ulang
-perintah instalasi v1.6.0 di atas. Tunggu operasi yang sedang berjalan selesai
+perintah instalasi v1.6.1 di atas. Tunggu operasi yang sedang berjalan selesai
 sebelum menutup panel. Pada stack WPI yang sudah
 selesai disiapkan, bootstrap otomatis mengaktifkan Redis dan pengelolaan PHP/FPM tanpa
 menginstal ulang WordPress atau meminta pengaturan tambahan.
 
-Upgrade ke v1.6.0 mempertahankan domain dan data yang sudah terpasang. Domain
+Upgrade ke v1.6.1 mempertahankan domain dan data yang sudah terpasang. Domain
 secondary versi sebelumnya tetap menjadi Redirect 301; domain tersebut tidak
 otomatis diubah menjadi Alias. Add domain baru memakai Alias secara standar.
 
@@ -366,7 +369,7 @@ otomatis diubah menjadi Alias. Add domain baru memakai Alias secara standar.
 Versi hingga v1.2.0 mengunci seluruh sesi panel, termasuk saat menunggu pilihan.
 Pesan `Panel WPI lain sedang berjalan. Tutup panel tersebut dahulu.` dapat
 muncul ketika panel lama masih terbuka di terminal atau sesi SSH lain. Tutup
-panel tersebut dengan **0** saat sudah kembali ke menu, lalu pasang v1.6.0.
+panel tersebut dengan **0** saat sudah kembali ke menu, lalu pasang v1.6.1.
 
 Mulai v1.2.1, menu, prompt, `sudo wpi list`, dan `sudo wpi status` tidak menahan
 kunci operasi. Beberapa panel dapat dibuka bersamaan; operasi yang mengubah

@@ -7,7 +7,7 @@ spare worker seperti pada panel web.
 
 Instalasi baru otomatis mengaktifkan fitur ini saat setup stack selesai.
 Pada server yang sudah memakai WPI v1.0.0, v1.1.0, v1.2.0, v1.2.1, atau v1.2.2,
-jalankan ulang bootstrap v1.6.0 sesuai [README](../README.md#instalasi-di-ubuntu).
+jalankan ulang bootstrap v1.6.1 sesuai [README](../README.md#instalasi-di-ubuntu).
 Stack yang sudah selesai disiapkan akan diaktifkan otomatis, sementara situs,
 database, domain, dan
 backup tetap digunakan.

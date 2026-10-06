@@ -119,6 +119,13 @@ self-signed fixture dipercaya secara eksplisit untuk probe Repair; kode produksi
 tetap memvalidasi TLS.
 
 Fixture Redis memakai plugin resmi 3.0.0 dan dua situs WordPress nyata.
+Mulai v1.6.1, request PHP-FPM harus menambah metrik plugin, dan API Metrics
+resmi diuji untuk penyimpanan, pembacaan, penghitungan, serta pemangkasan
+sampel. Timestamp objek fixture dipakai untuk dua kelompok menit, pengecualian
+60 detik terbaru, dan retensi; jam global dan waktu tunggu server tidak diubah.
+ACL lama harus menolak operasi metrik, sedangkan upgrade ACL harus
+mempertahankan kredensial dan entri cache. Perintah administrasi serta
+prefix situs lain tetap ditolak.
 Sebuah key yang dibuat proses WP-CLI dibaca proses WP-CLI berikutnya serta
 request PHP-FPM. Dua pembacaan 20 option non-autoload membandingkan jumlah
 query SQL setelah flush dan ketika cache hangat, tanpa mengukur waktu runner

@@ -72,6 +72,41 @@ WordPress menerima kredensial yang diperlukan untuk koneksi. Password tidak
 ditampilkan pada status, dimasukkan ke argumen proses, atau dicetak dalam
 diagnosis. File konfigurasi dan ACL dikelola di `/etc/wpi/redis/`.
 
+## Grafik Metrics plugin
+
+Grafik kosong dengan pesan `Not enough data collected, yet.` belum membuktikan
+cache WordPress gagal. Plugin mencatat operasi object cache saat request
+WordPress selesai. Request yang dilayani sepenuhnya oleh cache halaman/CDN
+tidak menjalankan PHP dan tidak menghasilkan sampel plugin.
+
+Plugin mengambil sampel yang berumur lebih dari 60 detik, lalu menggabungkannya
+menjadi kelompok per menit. Grafik memerlukan setidaknya dua kelompok menit.
+Setelah aktivasi atau upgrade, buka beberapa halaman WordPress selama sekitar
+2–3 menit, lalu muat ulang tab Metrics. Data metrik memakai jendela satu jam
+secara standar. Perilaku ini berasal dari
+[pengumpul metrik resmi](https://github.com/rhubarbgroup/redis-cache/blob/3.0.0/includes/class-metrics.php)
+dan [kode grafik plugin](https://github.com/rhubarbgroup/redis-cache/blob/3.0.0/assets/js/admin.js).
+
+WPI v1.6.0 belum memberikan izin perintah sorted-set yang digunakan plugin
+untuk menyimpan dan membaca metrik. WPI v1.6.1 memperbaiki izin `ZADD`,
+`ZRANGEBYSCORE`, `ZREMRANGEBYSCORE`, dan `ZCOUNT` hanya untuk prefix situs.
+Upgrade menerapkan ulang ACL pada instance yang sedang berjalan; kredensial
+dan isi cache tetap dipertahankan. Memasang ulang plugin atau flush saja
+tidak memperbaiki ACL versi lama.
+
+Periksa koneksi melalui CLI:
+
+```bash
+sudo wpi redis-status
+```
+
+Untuk situs yang memakai cache WPI, status menampilkan `enabled`,
+`service_active`, `connected`, serta hit/miss dan penggunaan memori Redis.
+Di plugin WordPress, tab Overview/Diagnostics menampilkan koneksi dan
+jumlah metrik yang direkam. Jika koneksi baik tetapi grafik tetap kosong,
+periksa apakah Metrics dinonaktifkan (`WP_REDIS_DISABLE_METRICS`) atau
+request PHP belum menghasilkan sampel pada rentang menit yang dibutuhkan.
+
 ## Anggaran RAM otomatis
 
 WPI menghitung satu anggaran Redis untuk seluruh server dari RAM efektif

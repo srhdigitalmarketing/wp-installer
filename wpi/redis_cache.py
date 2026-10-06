@@ -303,7 +303,9 @@ class RedisCache:
         commands = ('+get +set +setex +psetex +mget +mset +del +unlink +exists '
                     '+incrby +decrby +expire +pexpire +ttl +pttl +type +scan '
                     '+ping +info +dbsize +flushdb +multi +exec +discard +watch '
-                    '+unwatch +auth +select +echo')
+                    '+unwatch +auth +select +echo '
+                    # Official Redis Object Cache metrics use one prefixed sorted set.
+                    '+zadd +zrangebyscore +zremrangebyscore +zcount')
         # Redis 6.0 handles QUIT outside its command table; granting +quit
         # makes ACL loading fail even though closing a connection works.
         # Redis ACL files accept user declarations only, including no comments.
@@ -319,6 +321,46 @@ class RedisCache:
                   f'dir {paths["socket"].parent}\nlogfile ""\n')
         return config, acl
 
+    @staticmethod
+    def _apply_site_acl(client, identifier, acl):
+        """Replace one managed user's rules without disconnecting Redis 6 clients."""
+        name = f'wpi_{identifier}'
+        content = acl.decode() if isinstance(acl, bytes) else acl
+        lines = [line.split()[2:] for line in content.splitlines()
+                 if line.startswith(f'user {name} ')]
+        if len(lines) != 1:
+            raise ValueError('Pengguna ACL situs Redis tidak valid.')
+        rules = lines[0]
+        if len(rules) < 5 or rules[0] != 'on' or not re.fullmatch(r'#[a-f0-9]{64}', rules[1]) \
+                or rules[2:4] != [f'~wpi:{identifier}:*', '-@all'] \
+                or not all(re.fullmatch(r'\+[a-z]+', rule) for rule in rules[4:]):
+            raise ValueError('Aturan ACL situs Redis tidak valid.')
+        # ACL LOAD frees named users (including the admin) on Redis 6. SETUSER
+        # modifies the existing user in place; reset prevents inherited grants.
+        client.command('ACL', 'SETUSER', name, 'reset', *rules)
+
+    def _restore_live(self, snapshots, limits=None):
+        """Restore saved managed quota/site ACL while keeping active connections."""
+        identifiers = {path.stem for path in snapshots if path.suffix == '.acl' and
+                       re.fullmatch(r'[a-f0-9]{12}', path.stem)}
+        for identifier in identifiers:
+            try:
+                if not self._check(['systemctl', 'is-active', self.service(identifier)]):
+                    continue
+                paths = self._paths(identifier)
+                acl = snapshots.get(paths['acl'], (None,))[0]
+                config = snapshots.get(paths['config'], (None,))[0]
+                if acl is None or config is None:
+                    continue
+                match = re.search(rb'^maxmemory (\d+)$', config, re.M)
+                with self._client(identifier) as client:
+                    self._apply_site_acl(client, identifier, acl)
+                    quota = (limits or {}).get(identifier, int(match[1]) if match else None)
+                    if quota is not None:
+                        client.command('CONFIG', 'SET', 'maxmemory', quota)
+            except (OSError, ValueError, RedisProtocolError):
+                pass
+
     def _instance(self, identifier, maxmemory_mib, start=False, create=False):
         paths = self._paths(identifier)
         config, acl = self._render(identifier, maxmemory_mib, create=create)
@@ -329,7 +371,7 @@ class RedisCache:
         if active:
             with self._client(identifier) as client:
                 if old_acl != acl.encode():
-                    client.command('ACL', 'LOAD')
+                    self._apply_site_acl(client, identifier, acl)
                 if changed:
                     client.command('CONFIG', 'SET', 'maxmemory', maxmemory_mib * MIB)
                     client.command('CONFIG', 'SET', 'maxmemory-policy', 'allkeys-lfu')
@@ -413,13 +455,7 @@ class RedisCache:
             self._save_policy(profile)
         except BaseException:
             self._restore(snapshots)
-            for identifier, value in live.items():
-                try:
-                    with self._client(identifier) as client:
-                        client.command('CONFIG', 'SET', 'maxmemory', value)
-                        client.command('ACL', 'LOAD')
-                except (OSError, RedisProtocolError):
-                    pass
+            self._restore_live(snapshots, limits=live)
             raise
         return {'enabled': True, 'changed': any(_bytes(path) != value[0]
                 for path, value in snapshots.items()), **profile}
@@ -555,6 +591,7 @@ class RedisCache:
             return self._prepare(site)
         except BaseException:
             self._restore(snapshots)
+            self._restore_live(snapshots)
             if not was_active:
                 self._check(['systemctl', 'disable', '--now', self.service(site['id'])])
             raise
@@ -708,18 +745,7 @@ class RedisCache:
                 except (OSError, RuntimeError):
                     pass
             self._restore(snapshots)
-            for identifier in set(self._ids()) | {site['id']}:
-                try:
-                    if self._check(['systemctl', 'is-active', self.service(identifier)]):
-                        old = _bytes(self._paths(identifier)['config'])
-                        if old is not None:
-                            match = re.search(rb'^maxmemory (\d+)$', old, re.M)
-                            with self._client(identifier) as client:
-                                if match:
-                                    client.command('CONFIG', 'SET', 'maxmemory', int(match[1]))
-                                client.command('ACL', 'LOAD')
-                except (OSError, ValueError, RedisProtocolError):
-                    pass
+            self._restore_live(snapshots)
             if not was_active:
                 self._check(['systemctl', 'disable', '--now', self.service(site['id'])])
             raise

@@ -316,6 +316,176 @@ def cache_probe(site, key, expected=None):
     return json.loads(manager.wp(site, 'eval', script).stdout)
 
 
+def metrics_probe(site, script):
+    """Load the actual plugin, while keeping CLI probes out of HTTP metrics."""
+    # Manager.wp intentionally skips plugins for maintenance. This fixture
+    # instead boots the installed, activated plugin without changing its code.
+    prelude = (r"$class='Rhubarb\RedisCache\Metrics'; "
+               "remove_action('shutdown', [$class, 'record']); ")
+    php = f'/usr/bin/php{manager.config["php_version"]}'
+    command = ['runuser', '-u', 'www-data', '--', php, core.WP,
+               '--path=' + site['root'], '--skip-themes', 'eval', prelude + script]
+    result = manager.runner(command, cwd=site['root'], env={'WP_CLI_PHP': php}, timeout=45)
+    return json.loads(result.stdout)
+
+
+def verify_redis_metrics_upgrade(site):
+    """Upgrade old ACL plus memory policy without dropping a live app client."""
+    from wpi.cli import operation_lock
+    from wpi.redis_cache import RedisProtocolError
+
+    identifier = site['id']
+    assert re.fullmatch('[a-f0-9]{12}', identifier)
+    assert site['redis_cache']['username'] == 'wpi_' + identifier
+    assert site['redis_cache']['socket'] == f'/run/wpi-redis-{identifier}/redis.sock'
+    acl_path = Path('/etc/wpi/redis') / (identifier + '.acl')
+    config_path = Path('/etc/wpi/redis') / (identifier + '.conf')
+    credentials_path = manager.data / 'redis/credentials' / (identifier + '.json')
+    assert all(path.is_file() and not path.is_symlink()
+               for path in (acl_path, config_path, credentials_path))
+    credentials_before = credentials_path.read_bytes()
+    acl_before, config_before = acl_path.read_bytes(), config_path.read_bytes()
+    grants = {'+zadd', '+zrangebyscore', '+zremrangebyscore', '+zcount'}
+    lines = acl_before.decode().splitlines()
+    matching = [index for index, line in enumerate(lines)
+                if line.startswith('user ' + site['redis_cache']['username'] + ' ')]
+    assert len(matching) == 1, 'The managed site ACL did not have one user declaration.'
+    index = matching[0]
+    tokens = lines[index].split()
+    assert grants <= set(tokens), 'The new Metrics permissions were not generated.'
+    old_rules = [token for token in tokens[2:] if token not in grants]
+    lines[index] = ' '.join(tokens[:2] + old_rules)
+
+    manager.wp(site, 'cache', 'set', 'wpi-upgrade-sentinel', 'keep-upgrade-cache', 'wpi_ci')
+    assert cache_probe(site, 'wpi-upgrade-sentinel', 'keep-upgrade-cache')['matches'] is True
+    held_key = f'wpi:{identifier}:ci-held-client'
+    sorted_key = f'wpi:{identifier}:ci-upgrade-metrics'
+    # Match the real upgrade's operation lock so the resource timer cannot
+    # repair the deliberately old ACL between arranging and checking it.
+    with operation_lock(), manager.redis._client(identifier, admin=False) as held:
+        assert held.command('SET', held_key, 'live-before-upgrade') == 'OK'
+        with manager.redis._client(identifier) as admin:
+            current_limit = int(admin.command('CONFIG', 'GET', 'maxmemory')[1])
+            used = re.search(r'^used_memory:(\d+)\r?$', str(admin.command('INFO', 'memory')), re.M)
+            lowered_limit = current_limit - autotune.MIB
+            assert used and lowered_limit > int(used[1]) + 4 * autotune.MIB, \
+                'The disposable cache lacked headroom for the upgrade fixture.'
+            old_config, replacements = re.subn(rb'^maxmemory \d+$',
+                                               b'maxmemory ' + str(lowered_limit).encode(),
+                                               config_before, flags=re.M)
+            assert replacements == 1
+            acl_path.write_text('\n'.join(lines) + '\n')
+            config_path.write_bytes(old_config)
+            # ACL LOAD itself disconnects named clients on Redis 6. Apply the
+            # old rules to this existing user in place when arranging the test.
+            assert admin.command('ACL', 'SETUSER', tokens[1], 'reset', *old_rules) == 'OK'
+            assert admin.command('CONFIG', 'SET', 'maxmemory', lowered_limit) == 'OK'
+        try:
+            held.command('ZADD', sorted_key, '1', 'fixture')
+        except RedisProtocolError:
+            pass
+        else:
+            raise AssertionError('The simulated old ACL unexpectedly allowed Metrics writes.')
+
+        manager.redis.optimize()
+        assert held.command('PING') == 'PONG', 'Redis ACL upgrade disconnected the existing application client.'
+        assert held.command('GET', held_key) == 'live-before-upgrade', 'Redis ACL upgrade lost cached data.'
+        assert held.command('ZADD', sorted_key, '1', 'fixture') == 1
+        assert held.command('ZCOUNT', sorted_key, '-inf', '+inf') == 1
+        assert held.command('DEL', held_key, sorted_key) == 2
+    with manager.redis._client(identifier) as admin:
+        assert int(admin.command('CONFIG', 'GET', 'maxmemory')[1]) == current_limit
+    assert acl_path.read_bytes() == acl_before and config_path.read_bytes() == config_before
+    assert credentials_path.read_bytes() == credentials_before, 'Redis upgrade changed the site credential.'
+    assert cache_probe(site, 'wpi-upgrade-sentinel', 'keep-upgrade-cache')['matches'] is True
+    manager.wp(site, 'cache', 'delete', 'wpi-upgrade-sentinel', 'wpi_ci')
+    print('Real Redis upgrade: old ACL plus memory configuration updated; held application connection, '
+          'cache data and credential preserved; new Metrics permissions usable on the held client.', flush=True)
+
+
+def verify_redis_metrics(site, peer):
+    """Exercise plugin record/get/count/discard under the real site's ACL."""
+    from wpi.redis_cache import RedisProtocolError
+
+    verify_redis_metrics_upgrade(site)
+    probe = Path(site['root']) / 'wpi-ci-metrics.php'
+    probe.write_text(r"<?php require __DIR__ . '/wp-load.php'; "
+                     "header('Content-Type: application/json'); "
+                     r"$class='Rhubarb\RedisCache\Metrics'; "
+                     "echo json_encode(['active'=>$class::is_active(), "
+                     "'persistent'=>wp_using_ext_object_cache()]);")
+    probe.chmod(0o644)
+    try:
+        before = metrics_probe(site, "echo json_encode(['active'=>$class::is_active(), "
+                                     "'count'=>$class::count()]);")
+        assert before['active'], 'The installed plugin did not enable Metrics.'
+        for _ in range(3):
+            status, _, body, code = expected_request(site['primary'], 200, path='/wpi-ci-metrics.php')
+            assert status == 200 and code == 0
+            assert json.loads(body) == {'active': True, 'persistent': True}
+        after = metrics_probe(site, "echo json_encode(['count'=>$class::count()]);")
+        assert after['count'] >= before['count'] + 3, \
+            'Real PHP-FPM requests did not record Redis Metrics under the site ACL.'
+
+        # Metrics::get omits the newest minute. Set timestamps on four
+        # disposable Metrics objects, leaving the server clock and production
+        # plugin unchanged. Two older minute bins are required by admin.js;
+        # the recent and expired objects validate the retrieval/retention rules.
+        summary = metrics_probe(site, r"""
+$minute=time()-(time()%60);
+$older=[];
+foreach ([180,120] as $age) {
+    $metric=new $class(); $metric->collect(); $metric->timestamp=$minute-$age;
+    $metric->save(); $older[]=$metric->id;
+}
+$recent=new $class(); $recent->collect(); $recent->save();
+$expired=new $class(); $expired->collect();
+$expired->timestamp=time()-$class::max_time()-120; $expired->save();
+$rows=$class::get();
+$ids=array_map(function($value) { return $value->id; }, $rows);
+$bins=array_unique(array_map(function($value) { return intdiv($value->timestamp,60); }, $rows));
+$extended=$class::get($class::max_time()+300);
+$expired_before=in_array($expired->id,array_map(function($value) { return $value->id; },$extended),true);
+$count_before=$class::count();
+$class::discard();
+$remaining=$class::get($class::max_time()+300);
+$remaining_ids=array_map(function($value) { return $value->id; },$remaining);
+echo json_encode([
+    'older_samples'=>count(array_intersect($older,$ids)),
+    'minute_bins'=>count($bins), 'recent_hidden'=>!in_array($recent->id,$ids,true),
+    'expired_before'=>$expired_before,
+    'expired_removed'=>!in_array($expired->id,$remaining_ids,true),
+    'older_retained'=>count(array_intersect($older,$remaining_ids))===2,
+    'count_before'=>$count_before, 'count_after'=>$class::count()
+]);
+""")
+        assert summary['older_samples'] == 2 and summary['minute_bins'] >= 2, \
+            'Metrics retrieval did not provide two distinct minute bins for the chart.'
+        assert summary['recent_hidden'], 'Metrics retrieval included the newest minute.'
+        assert summary['expired_before'] and summary['expired_removed'], \
+            'Metrics retention did not discard the expired sample through its site ACL.'
+        assert summary['older_retained'] and summary['count_before'] > 0 and summary['count_after'] > 0
+
+        # Sorted-set grants must retain key-prefix isolation and cannot confer
+        # administrative commands. This uses the site's own credential/socket;
+        # errors and cache values are never emitted into CI logs.
+        with manager.redis._client(site['id'], admin=False) as client:
+            for command in (('ZADD', f'wpi:{peer["id"]}:metrics', '1', 'fixture'),
+                            ('CONFIG', 'GET', 'maxmemory'), ('ACL', 'LIST'), ('FLUSHALL',)):
+                try:
+                    client.command(*command)
+                except RedisProtocolError:
+                    continue
+                raise AssertionError('Site Redis ACL unexpectedly allowed ' + command[0])
+        assert cache_probe(peer, 'wpi-peer-sentinel', 'keep-peer-cache')['matches'] is True
+        print(f'Real Redis Metrics: 3 PHP-FPM requests recorded; '
+              f'chart dataset has {summary["minute_bins"]} minute bins; '
+              'count/get/discard passed; recent samples hidden, expired sample removed; '
+              'peer-prefix and administrative commands remain denied.', flush=True)
+    finally:
+        probe.unlink(missing_ok=True)
+
+
 def redis_failure_diagnostics():
     """Classify disposable Redis errors without printing config, ACL, or secrets."""
     try:
@@ -428,6 +598,7 @@ def verify_redis_cache(site):
                               "? 'unsupported' : 'supported';").stdout == 'supported'
         listeners = subprocess.run(['ss', '-ltnp'], check=True, capture_output=True, text=True).stdout
         assert 'redis-server' not in listeners, 'Redis opened a TCP listener.'
+        verify_redis_metrics(site, peer)
 
         # Upstream Redis Object Cache reports connection failures. Diagnosis
         # and the resource timer must not silently reactivate a stopped service.
