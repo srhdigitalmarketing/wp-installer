@@ -131,6 +131,8 @@ class TargetMigration:
             raise ValueError('Nama database/user migrasi harus identitas WPI.')
         if site.get('status') != 'active':
             raise ValueError('Hanya situs WordPress aktif yang dapat dimigrasikan.')
+        if 'file_editor_enabled' in site and type(site['file_editor_enabled']) is not bool:
+            raise ValueError('Pilihan editor file migrasi harus boolean.')
         return site
 
     def _validate_tar(self, path):
@@ -584,6 +586,7 @@ class TargetMigration:
                     self.manager.runner(['chmod', '640', str(Path(site['root']) / 'wp-config.php')])
                     self.manager._site_memory_settings(site)
                     self.manager._site_cache_config(site)
+                    self.manager._site_file_editor_config(site)
                     backup = self.manager.backups / ident / ('migration-' + migration_id)
                     _safe_directory(backup)
                     if backup.exists():

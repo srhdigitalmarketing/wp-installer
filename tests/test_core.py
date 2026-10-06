@@ -77,6 +77,9 @@ class ManagerTests(unittest.TestCase):
                           return_value=self.web).start()
         mock.patch.object(core, "check_dns").start()
         mock.patch.object(core, "WWW", self.base / "www").start()
+        # FileEditor tests exercise config transactions; this command-boundary
+        # fixture deliberately does not execute WP-CLI writes.
+        self.editor_config = mock.patch.object(self.manager, '_site_file_editor_config').start()
 
     def test_primary_secondary_and_phpmyadmin_domains_are_unique(self):
         extra = {**self.site, "id": "123456abcdef", "primary": "other.example.com",
@@ -420,6 +423,8 @@ class ManagerTests(unittest.TestCase):
                                                            password=password)
         self.assertEqual(result["status"], "active")
         self.assertEqual(returned_password, password)
+        self.assertIs(result['file_editor_enabled'], False)
+        self.editor_config.assert_called_once_with(result)
         for argv, _ in self.commands:
             self.assertFalse(any(password in value for value in argv))
             self.assertFalse(any("abc123" * 8 in value for value in argv))
@@ -441,6 +446,7 @@ class ManagerTests(unittest.TestCase):
 
     def test_resume_repairs_partial_core_without_recreating_installed_wordpress(self):
         self.site["status"] = "incomplete"
+        self.site['file_editor_enabled'] = True
         self.manager.save_site(self.site)
         root = Path(self.site["root"])
         root.mkdir(parents=True)
@@ -468,6 +474,8 @@ class ManagerTests(unittest.TestCase):
         self.assertTrue(any("download" in argv and "--force" in argv for argv, _ in self.commands))
         self.assertFalse(any("install" in argv and "core" in argv for argv, _ in self.commands))
         self.assertEqual((root / "wp-config.php").read_text(), "existing-config")
+        self.assertIs(result['file_editor_enabled'], True)
+        self.assertIs(self.editor_config.call_args.args[0]['file_editor_enabled'], True)
 
     def test_phpmyadmin_delete_never_invokes_sql_or_removes_a_package(self):
         cfg = self.manager.config
@@ -595,6 +603,25 @@ class ManagerTests(unittest.TestCase):
         self.assertNotIn(credential['database_password'], password_call[0])
         self.assertEqual(password_call[1]['input'], credential['database_password'] + '\n')
         database.assert_called_once_with(restored, snapshot.resolve())
+
+    def test_restore_older_backup_preserves_current_file_editor_choice_before_sql_boot(self):
+        root = Path(self.site['root'])
+        root.mkdir(parents=True)
+        (root / 'wp-config.php').write_text('old-disabled-config')
+        self.manager.save_site({**self.site, 'file_editor_enabled': False})
+        snapshot = self.manager.backup(self.site['id'])
+        current = {**self.site, 'file_editor_enabled': True}
+        self.manager.save_site(current)
+        self.web.certificate_ready.return_value = True
+
+        def import_database(site, folder):
+            self.assertIs(site['file_editor_enabled'], True)
+            self.editor_config.assert_called_once_with(site)
+
+        with mock.patch.object(self.manager, 'restore_database', side_effect=import_database):
+            restored, safety = self.manager.restore(current['id'], snapshot)
+        self.assertIs(restored['file_editor_enabled'], True)
+        self.assertIs(json.loads((safety / 'site.json').read_text())['file_editor_enabled'], True)
 
     def test_restore_migration_refuses_missing_credentials_before_file_swap(self):
         root = Path(self.site['root'])

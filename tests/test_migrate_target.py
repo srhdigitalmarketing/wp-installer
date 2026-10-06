@@ -149,6 +149,29 @@ class TargetImportTests(unittest.TestCase):
         self.assertIn('migration-ssl-tick', (self.target.units / 'wpi-migration-ssl.service').read_text())
         self.assertEqual(imported['status'], 'active')
 
+    def test_import_preserves_editor_policy_and_applies_it_before_wordpress_database_boot(self):
+        source = {**SITE, 'file_editor_enabled': True}
+        self.sha = write_bundle(self.bundle, payloads(source))
+
+        def restore_database(site, backup):
+            self.assertIs(site['file_editor_enabled'], True)
+            policy.assert_called_once_with(site)
+
+        self.manager.restore_database.side_effect = restore_database
+        with patch.object(self.manager, '_site_file_editor_config') as policy:
+            report = self.import_bundle()
+        self.assertEqual(report['status'], 'ready')
+        self.assertIs(self.manager.site(IDENT)['file_editor_enabled'], True)
+
+    def test_import_rejects_non_boolean_editor_policy_before_provisioning(self):
+        for bad in ('true', 1, None, {}):
+            with self.subTest(value=bad):
+                self.sha = write_bundle(self.bundle, payloads({**SITE, 'file_editor_enabled': bad}))
+                with self.assertRaisesRegex(ValueError, 'editor file migrasi'):
+                    self.import_bundle()
+        self.manager.setup.assert_not_called()
+        self.manager.restore_database.assert_not_called()
+
     def test_completed_import_retry_does_not_reimport_or_overwrite_current_site(self):
         self.import_bundle()
         current = self.manager.site(IDENT)

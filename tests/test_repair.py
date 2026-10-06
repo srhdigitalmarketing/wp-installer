@@ -164,6 +164,26 @@ class RepairTests(unittest.TestCase):
         self.assertEqual(report['status'], 'resolved')
         self.assertNotIn('FATALCUSTOM', self.config.read_text())
 
+    def test_recovery_uses_current_editor_policy_instead_of_snapshot_policy(self):
+        self.config.write_text(GOOD_CONFIG.replace("/* That's all, stop editing! */",
+                               "define('DISALLOW_FILE_EDIT', 'true');\n/* That's all, stop editing! */"))
+        self.repair.remember_config(self.site['id'])
+        self.site['file_editor_enabled'] = True
+        self.manager.save_site(self.site)
+        self.config.write_text('<?php BROKEN parse error')
+
+        def overlay(site, candidate=None):
+            self.assertIs(site['file_editor_enabled'], True)
+            self.assertNotEqual(candidate, self.config)
+            self.repair._config_set(site, candidate, 'DISALLOW_FILE_EDIT', 'false', raw=True)
+
+        with mock.patch.object(self.manager, '_site_file_editor_config', side_effect=overlay) as policy:
+            report = self.repair.repair(self.site['id'])
+        self.assertEqual(report['status'], 'resolved')
+        policy.assert_called_once()
+        self.assertIn("define('DISALLOW_FILE_EDIT', 'false');", self.config.read_text())
+        self.assertIs(self.manager.site(self.site['id'])['file_editor_enabled'], True)
+
     def _complete_backup(self, content):
         folder = self.manager.backups / self.site['id'] / '20260101-complete'
         folder.mkdir(parents=True)

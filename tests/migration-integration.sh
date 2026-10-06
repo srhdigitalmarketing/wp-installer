@@ -185,6 +185,20 @@ with mock.patch('wpi.core.check_dns'), mock.patch.object(WebStack, 'obtain_certi
     manager.add_domain(site['id'], HOSTS[1], kind='alias')
     manager.add_domain(site['id'], HOSTS[2], kind='redirect')
 site = manager.site(site['id'])
+assert site['file_editor_enabled'] is False
+editor_caps = ("$user=get_user_by('login','migration_admin'); wp_set_current_user($user->ID); "
+               "echo json_encode(['edit_plugins'=>current_user_can('edit_plugins'), "
+               "'edit_themes'=>current_user_can('edit_themes'), "
+               "'install_plugins'=>current_user_can('install_plugins'), "
+               "'update_plugins'=>current_user_can('update_plugins')]);")
+assert json.loads(manager.wp(site, 'eval', editor_caps).stdout) == {
+    'edit_plugins': False, 'edit_themes': False, 'install_plugins': True, 'update_plugins': True}
+manager.set_file_editor(site['id'], True)
+site = manager.site(site['id'])
+assert site['file_editor_enabled'] is True
+assert manager.file_editor_status(site['id'])['enabled'] is True
+assert json.loads(manager.wp(site, 'eval', editor_caps).stdout) == {
+    'edit_plugins': True, 'edit_themes': True, 'install_plugins': True, 'update_plugins': True}
 manager.set_php_settings(memory_limit=500, upload_max_filesize=128)
 assert site['redis_cache']['enabled'], 'Source installation did not enable persistent object cache.'
 assert manager.wp(site, 'eval', "echo wp_using_ext_object_cache() ? 'yes' : 'no';").stdout == 'yes'
@@ -215,6 +229,7 @@ manifest = {'site': site, 'post': post,
 Path('/root/source-manifest.json').write_text(json.dumps(manifest))
 print('Source fixture installed: WordPress, content, administrator, upload, Alias, and Redirect.', flush=True)
 print('Source persistent Redis cache enabled; private credential hash and source-only cache sentinel recorded.', flush=True)
+print('Source file editor explicitly enabled; real administrator edit permissions granted and plugin install/update remain allowed.', flush=True)
 PY
 docker cp "$WPI_CI_WORK/source-fixture.py" "$WPI_CI_SOURCE:/root/source-fixture.py"
 docker exec "$WPI_CI_SOURCE" python3 -u /root/source-fixture.py
@@ -491,8 +506,17 @@ site = manager.site(original['id'])
 report = target.status()['migrations'][0]
 hosts = [site['primary'], *site['aliases'], *site['secondary']]
 assert len(manager.sites()) == 1
-for name in ('id', 'primary', 'aliases', 'secondary', 'admin', 'title', 'db_name', 'db_user'):
+for name in ('id', 'primary', 'aliases', 'secondary', 'admin', 'title', 'db_name', 'db_user', 'file_editor_enabled'):
     assert site[name] == original[name], name
+assert site['file_editor_enabled'] is True
+assert manager.file_editor_status(site['id'])['enabled'] is True
+editor_caps = ("$user=get_user_by('login','migration_admin'); wp_set_current_user($user->ID); "
+               "echo json_encode(['edit_plugins'=>current_user_can('edit_plugins'), "
+               "'edit_themes'=>current_user_can('edit_themes'), "
+               "'install_plugins'=>current_user_can('install_plugins'), "
+               "'update_plugins'=>current_user_can('update_plugins')]);")
+assert json.loads(manager.wp(site, 'eval', editor_caps).stdout) == {
+    'edit_plugins': True, 'edit_themes': True, 'install_plugins': True, 'update_plugins': True}
 assert manager.wp(site, 'option', 'get', 'home').stdout.strip() == 'https://' + site['primary']
 assert manager.wp(site, 'user', 'get', 'migration_admin', '--field=user_pass').stdout.strip() == manifest['admin_hash']
 assert manager.wp(site, 'db', 'tables', '--all-tables-with-prefix').stdout.strip() == manifest['tables']
@@ -535,6 +559,10 @@ if stage == 'before-dns':
     restored, safety = manager.restore(site['id'], imported_backup)
     site = manager.site(site['id'])
     assert restored['migration_id'] == site['migration_id'] == report['migration_id']
+    assert restored['file_editor_enabled'] is True and site['file_editor_enabled'] is True
+    assert manager.file_editor_status(site['id'])['enabled'] is True
+    assert json.loads(manager.wp(site, 'eval', editor_caps).stdout) == {
+        'edit_plugins': True, 'edit_themes': True, 'install_plugins': True, 'update_plugins': True}
     for name in ('primary', 'aliases', 'secondary'):
         assert site[name] == original[name]
     assert Path(safety).is_dir()
@@ -578,6 +606,27 @@ def expected(host, path, status, https=True):
             return response
         time.sleep(0.2)
     raise AssertionError((host, path, response[0], response[3]))
+
+# Configuration is rewritten several times during migration and raw backup
+# restore. Prove the chosen policy still reaches the actual destination FPM,
+# not only metadata or a separate CLI PHP interpreter.
+editor_probe = Path(site['root']) / 'wpi-ci-editor-caps.php'
+editor_probe.write_text("<?php require __DIR__ . '/wp-load.php'; "
+                        "$user=get_user_by('login','migration_admin'); wp_set_current_user($user->ID); "
+                        "header('Content-Type: application/json'); "
+                        "echo json_encode(['edit_plugins'=>current_user_can('edit_plugins'), "
+                        "'edit_themes'=>current_user_can('edit_themes'), "
+                        "'install_plugins'=>current_user_can('install_plugins'), "
+                        "'update_plugins'=>current_user_can('update_plugins')]);")
+editor_probe.chmod(0o644)
+try:
+    editor_response = expected(site['primary'], '/wpi-ci-editor-caps.php', 200)
+    assert json.loads(editor_response[2]) == {
+        'edit_plugins': True, 'edit_themes': True, 'install_plugins': True, 'update_plugins': True}
+finally:
+    editor_probe.unlink(missing_ok=True)
+print('Destination file-editor policy retained through migration/restore; actual FPM administrator '
+      'edit permissions and unchanged plugin install/update permissions verified.', flush=True)
 
 for host in [site['primary'], *site['aliases']]:
     response = expected(host, '/migration-preserved/', 200)
@@ -694,6 +743,8 @@ manager = Manager()
 manifest = json.loads(Path('/root/source-manifest.json').read_text())
 site = manager.site(manifest['site']['id'])
 assert site['status'] == 'active'
+assert site['file_editor_enabled'] is True
+assert manager.file_editor_status(site['id'])['enabled'] is True
 assert manager.wp(site, 'maintenance-mode', 'is-active', check=False).returncode != 0
 assert manager.wp(site, 'user', 'get', 'migration_admin', '--field=user_pass').stdout.strip() == manifest['admin_hash']
 manager.wp(site, 'core', 'is-installed')

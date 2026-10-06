@@ -226,6 +226,32 @@ def redis_interactive(manager):
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
 
 
+def show_file_editor(report):
+    state = lambda enabled: 'Aktif' if enabled else 'Nonaktif'
+    print(f"{report['primary']}: Editor menurut konfigurasi: {state(report['enabled'])}.")
+    managed = report['managed_enabled']
+    print('Pengaturan WPI: ' + ('Belum ditetapkan' if managed is None else state(managed)) + '.')
+    if report['blocked_by_file_mods']:
+        print('DISALLOW_FILE_MODS aktif; editor diblokir oleh konfigurasi WordPress.')
+        print('DISALLOW_FILE_EDIT: ' + ('mengizinkan editor' if report['configured_enabled']
+                                        else 'memblokir editor') + '.')
+    if 'changed' in report:
+        print('Pengaturan editor disimpan.' if report['changed'] else 'Pengaturan sudah sesuai.')
+    if report.get('backup'):
+        print('Backup wp-config.php: ' + str(report['backup']))
+
+
+def file_editor_interactive(manager):
+    identifier = select_site(manager)
+    show_file_editor(manager.file_editor_status(identifier))
+    mode = ask('Editor file plugin / theme: 1=Aktifkan, 2=Nonaktifkan, 0=Kembali', '0')
+    if mode == '0':
+        return
+    if mode not in ('1', '2'):
+        raise ValueError('Pilihan harus 0, 1, atau 2.')
+    show_file_editor(run_operation(manager.set_file_editor, identifier, enabled=mode == '1'))
+
+
 def menu(manager):
     choices = [
         ('1', 'Install WordPress otomatis'), ('2', 'Daftar situs & domain'),
@@ -238,6 +264,7 @@ def menu(manager):
         ('15', 'Migrasi otomatis ke server baru'),
         ('16', 'Auto repair situs / error 500'), ('17', 'PHP memory limit & upload size'),
         ('18', 'Optimalkan Redis & PHP'), ('19', 'Status / kelola cache Redis'),
+        ('20', 'Editor file plugin / theme'),
         ('0', 'Keluar'),
     ]
     while True:
@@ -308,6 +335,8 @@ def menu(manager):
                 print(json.dumps(run_operation(manager.optimize), ensure_ascii=False, indent=2, sort_keys=True))
             elif choice == '19':
                 redis_interactive(manager)
+            elif choice == '20':
+                file_editor_interactive(manager)
             else:
                 print('Pilihan tidak dikenal.')
         except (ValueError, RuntimeError, OSError) as error:
@@ -362,6 +391,11 @@ def parser():
     repair = commands.add_parser('repair', help='Diagnosis dan repair situs yang dipilih.')
     repair.add_argument('site')
     repair.add_argument('--check', action='store_true', help='Diagnosis saja, tanpa mengubah server.')
+    editor = commands.add_parser('file-editor', help='Lihat atau ubah editor file plugin/theme per situs.')
+    editor.add_argument('site', help='ID/domain situs.')
+    editor_mode = editor.add_mutually_exclusive_group()
+    editor_mode.add_argument('--enable', action='store_true', help='Aktifkan editor file plugin/theme.')
+    editor_mode.add_argument('--disable', action='store_true', help='Nonaktifkan editor file plugin/theme.')
     settings = commands.add_parser('php-settings', help='Lihat atau ubah memory/upload seluruh situs.')
     settings.add_argument('--memory-limit', help='MB, 500M, 1G, atau auto.')
     settings.add_argument('--upload-max-filesize', help='MB, 128M, 1G, atau auto.')
@@ -448,6 +482,13 @@ def main(argv=None):
                 report = run_operation(manager.repair_site, args.site)
             show_repair(report)
             return 1 if report['status'] == 'unresolved' else 0
+        if command == 'file-editor':
+            if args.enable or args.disable:
+                report = run_operation(manager.set_file_editor, args.site, enabled=args.enable)
+            else:
+                report = manager.file_editor_status(args.site)
+            show_file_editor(report)
+            return 0
         if command == 'php-settings':
             if args.reset and (args.memory_limit is not None or args.upload_max_filesize is not None):
                 raise ValueError('--reset tidak digabung dengan pengaturan limit.')

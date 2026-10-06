@@ -166,6 +166,21 @@ class Manager:
         return settings.reset() if reset else settings.apply(memory_limit, upload_max_filesize)
 
     @property
+    def file_editor(self):
+        from .file_editor import FileEditor
+        return FileEditor(self)
+
+    def file_editor_status(self, identifier):
+        return self.file_editor.status(identifier)
+
+    def set_file_editor(self, identifier, enabled):
+        return self.file_editor.apply(identifier, enabled)
+
+    def _site_file_editor_config(self, site, candidate=None):
+        if 'file_editor_enabled' in site:
+            return self.file_editor.overlay_config(site, candidate=candidate)
+
+    @property
     def redis(self):
         from .redis_cache import RedisCache
         return RedisCache(self)
@@ -455,7 +470,8 @@ class Manager:
             raise ValueError('Direktori situs sudah ada.')
         site = {'id': ident, 'primary': host, 'aliases': [], 'secondary': [], 'root': str(root), 'tls': [],
                 'email': email, 'db_name': f'wpi_{ident}', 'db_user': f'wpi_{ident}',
-                'admin': admin, 'title': title, 'created_at': dt.datetime.now(dt.timezone.utc).isoformat(), 'status': 'installing'}
+                'admin': admin, 'title': title, 'file_editor_enabled': False,
+                'created_at': dt.datetime.now(dt.timezone.utc).isoformat(), 'status': 'installing'}
         root.mkdir(parents=True, mode=0o755)
         dbpass = secrets.token_hex(24)
         atomic_json(self.data / 'credentials' / (ident + '.json'),
@@ -476,7 +492,7 @@ class Manager:
                     f'--dbuser={site["db_user"]}', '--dbhost=localhost',
                     f'--dbprefix=wp_{ident[:6]}_', '--prompt=dbpass', input=dbpass + '\n')
             self.runner(['chmod', '640', str(root / 'wp-config.php')])
-            self.wp(site, 'config', 'set', 'DISALLOW_FILE_EDIT', 'true', '--raw')
+            self._site_file_editor_config(site)
             self.wp(site, 'config', 'set', 'WP_AUTO_UPDATE_CORE', 'minor')
             self._site_memory_settings(site)
             self.wp(site, 'core', 'install', f'--url=https://{host}', f'--title={title}',
@@ -516,6 +532,11 @@ class Manager:
         site = self.site(identifier)
         if site['status'] == 'active':
             raise ValueError('Situs sudah aktif. Gunakan SSL/update sesuai kebutuhan.')
+        # Incomplete older installations used the disabled default. Keep an
+        # explicit administrator choice instead of resetting it on a retry.
+        if 'file_editor_enabled' not in site:
+            site['file_editor_enabled'] = False
+            self.save_site(site)
         credentials = json.loads((self.data / 'credentials' / (site['id'] + '.json')).read_text())
         check_dns(site['primary'])
         dbpass = credentials['database_password']
@@ -541,13 +562,13 @@ class Manager:
                     '--dbhost=localhost', f'--dbprefix=wp_{site["id"][:6]}_', '--prompt=dbpass', input=dbpass + '\n')
         self.runner(['chmod', '640', str(Path(site['root']) / 'wp-config.php')])
         self._site_cache_config(site)
+        self._site_file_editor_config(site)
         installed = self.wp(site, 'core', 'is-installed', check=False)
         if installed.returncode:
             self.wp(site, 'core', 'install', f'--url=https://{site["primary"]}',
                     f'--title={site.get("title", "WordPress")}', f'--admin_user={site["admin"]}',
                     f'--admin_email={site["email"]}', '--skip-email', '--prompt=admin_password',
                     input=credentials['wordpress_password'] + '\n')
-        self.wp(site, 'config', 'set', 'DISALLOW_FILE_EDIT', 'true', '--raw')
         self.wp(site, 'config', 'set', 'WP_AUTO_UPDATE_CORE', 'minor')
         self._site_memory_settings(site)
         self.wp(site, 'rewrite', 'structure', '/%postname%/')
@@ -789,6 +810,9 @@ class Manager:
         # Preserve local opt-out and instance credentials across snapshots.
         if 'redis_cache' in current:
             old['redis_cache'] = copy.deepcopy(current['redis_cache'])
+        # Restoring content must not reset the current dashboard editor choice.
+        if 'file_editor_enabled' in current:
+            old['file_editor_enabled'] = current['file_editor_enabled']
         restore_credentials = None
         if current.get('migration_id'):
             # Imported snapshots retain the source's wp-config and manifest.
@@ -853,6 +877,7 @@ class Manager:
                         input=restore_credentials['database_password'] + '\n')
                 self.runner(['chmod', '640', str(root / 'wp-config.php')])
             self._site_cache_config(old)
+            self._site_file_editor_config(old)
             self.restore_database(old, folder)
             old['tls'] = [h for h in site_hosts(old) if self.web.certificate_ready(h)]
             self.web.write_site(old)

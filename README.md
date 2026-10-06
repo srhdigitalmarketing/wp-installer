@@ -43,6 +43,9 @@ panduan terbaru di bawah; perilakunya berbeda dari rekaman lama.
   Basic Auth tambahan. Hapus phpMyAdmin hanya melepas antarmuka web tersebut;
   **database dan situs WordPress tetap ada**.
 - Backup/restore situs, pemeriksaan layanan, dan pengelolaan SSL melalui menu.
+- **Aktifkan/nonaktifkan editor file plugin dan theme**, per situs melalui
+  **menu 20**. Pilihan disimpan untuk Repair, restore, dan migrasi; situs baru
+  memakai editor nonaktif. [Panduan editor file](docs/FILE-EDITOR.md).
 - **Repair error situs** melalui menu: pemeriksaan PHP `wp-config.php`, runtime
   WordPress, layanan, dan respons frontend/admin. WPI menyimpan config asli
   secara privat, memperbaiki penyebab umum yang dapat diverifikasi, lalu
@@ -96,12 +99,12 @@ sudo apt-get update
 sudo apt-get install -y curl ca-certificates
 
 curl -fL --proto '=https' --proto-redir '=https' \
-  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.6.1/install.sh \
+  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.7.0/install.sh \
   -o install.sh
 curl -fL --proto '=https' --proto-redir '=https' \
-  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.6.1/install.sh.sha256 \
+  https://github.com/srhdigitalmarketing/wp-installer/releases/download/v1.7.0/install.sh.sha256 \
   -o install.sh.sha256
-sha256sum --check install.sh.sha256 && sudo bash install.sh --version v1.6.1
+sha256sum --check install.sh.sha256 && sudo bash install.sh --version v1.7.0
 
 sudo wpi
 ```
@@ -114,25 +117,25 @@ percaya atau tinjau kode pada tag versi tersebut.
 
 ### Memakai bundle lokal
 
-Unduh `wp-installer-v1.6.1.zip` dan `wp-installer-v1.6.1.zip.sha256`
-dari [release v1.6.1](https://github.com/srhdigitalmarketing/wp-installer/releases/tag/v1.6.1),
+Unduh `wp-installer-v1.7.0.zip` dan `wp-installer-v1.7.0.zip.sha256`
+dari [release v1.7.0](https://github.com/srhdigitalmarketing/wp-installer/releases/tag/v1.7.0),
 lalu salin ke server bersama `install.sh`.
 
 ```bash
-sudo bash install.sh --bundle ./wp-installer-v1.6.1.zip
+sudo bash install.sh --bundle ./wp-installer-v1.7.0.zip
 sudo wpi
 ```
 
 Hash yang diperoleh secara terpisah juga dapat diberikan melalui `--sha256`:
 
 ```bash
-sudo bash install.sh --bundle ./wp-installer-v1.6.1.zip --sha256 HASH_SHA256_RILIS
+sudo bash install.sh --bundle ./wp-installer-v1.7.0.zip --sha256 HASH_SHA256_RILIS
 ```
 
 Validasi bundle tanpa pemasangan, tanpa akses root, dan tanpa jaringan:
 
 ```bash
-bash install.sh --bundle ./wp-installer-v1.6.1.zip --check-only
+bash install.sh --bundle ./wp-installer-v1.7.0.zip --check-only
 ```
 
 Mode ini memerlukan Bash dan Python 3.10+. SHA256, keamanan path ZIP, kelengkapan
@@ -158,7 +161,8 @@ kredensial yang ditampilkan setelah pemasangan di pengelola password.
 | 13 | Lihat kredensial situs | 14 | Lanjutkan instalasi gagal |
 | 15 | Migrasi otomatis ke server baru | 16 | Repair error situs |
 | 17 | PHP memory limit / max upload size | 18 | Optimalkan Redis dan PHP |
-| 19 | Status / kelola cache Redis | 0 | Keluar |
+| 19 | Status / kelola cache Redis | 20 | Editor file plugin / theme |
+| 0 | Keluar | | |
 
 Setiap situs mempunyai satu **Primary**. Pada menu **3 — Add domain**, pilih
 situs, masukkan domain baru, lalu pilih **Alias** atau **Redirect**. Alias adalah
@@ -244,6 +248,11 @@ sudo wpi redis-status
 sudo wpi redis-flush example.net
 sudo wpi redis-disable example.net
 sudo wpi redis-enable example.net
+
+# Editor kode plugin/theme di dashboard WordPress, berlaku per situs.
+sudo wpi file-editor example.net
+sudo wpi file-editor example.net --enable
+sudo wpi file-editor example.net --disable
 
 # Jalankan di server lama. Password diminta di terminal, bukan sebagai argumen.
 sudo wpi migrate --host 203.0.113.10 --user root
@@ -355,12 +364,12 @@ Menjalankan bootstrap lagi mengganti aplikasi secara atomik dan mempertahankan
 data situs serta backup. Paket server dan konten WordPress dikelola terpisah
 dari pembaruan aplikasi WPI. Untuk memperbarui instalasi versi sebelumnya,
 tutup menu lama yang sedang menunggu pilihan dengan **0**, lalu jalankan ulang
-perintah instalasi v1.6.1 di atas. Tunggu operasi yang sedang berjalan selesai
+perintah instalasi v1.7.0 di atas. Tunggu operasi yang sedang berjalan selesai
 sebelum menutup panel. Pada stack WPI yang sudah
 selesai disiapkan, bootstrap otomatis mengaktifkan Redis dan pengelolaan PHP/FPM tanpa
 menginstal ulang WordPress atau meminta pengaturan tambahan.
 
-Upgrade ke v1.6.1 mempertahankan domain dan data yang sudah terpasang. Domain
+Upgrade ke v1.7.0 mempertahankan domain dan data yang sudah terpasang. Domain
 secondary versi sebelumnya tetap menjadi Redirect 301; domain tersebut tidak
 otomatis diubah menjadi Alias. Add domain baru memakai Alias secara standar.
 
@@ -369,7 +378,7 @@ otomatis diubah menjadi Alias. Add domain baru memakai Alias secara standar.
 Versi hingga v1.2.0 mengunci seluruh sesi panel, termasuk saat menunggu pilihan.
 Pesan `Panel WPI lain sedang berjalan. Tutup panel tersebut dahulu.` dapat
 muncul ketika panel lama masih terbuka di terminal atau sesi SSH lain. Tutup
-panel tersebut dengan **0** saat sudah kembali ke menu, lalu pasang v1.6.1.
+panel tersebut dengan **0** saat sudah kembali ke menu, lalu pasang v1.7.0.
 
 Mulai v1.2.1, menu, prompt, `sudo wpi list`, dan `sudo wpi status` tidak menahan
 kunci operasi. Beberapa panel dapat dibuka bersamaan; operasi yang mengubah

@@ -49,6 +49,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from urllib.parse import urlencode
 from unittest import mock
 
 # Run integration against the package actually installed by bootstrap.
@@ -701,6 +702,168 @@ def verify_runcloud_domains(site, post):
     return manager.site(restored['id'])
 
 
+def file_editor_capabilities(site, enabled):
+    """Check actual core permissions through PHP-FPM; expose booleans only."""
+    probe = Path(site['root']) / 'wpi-ci-editor-caps.php'
+    probe.write_text("<?php require __DIR__ . '/wp-load.php'; "
+                     "$user=get_user_by('login', " + json.dumps(site['admin']) + "); "
+                     "wp_set_current_user($user ? $user->ID : 0); "
+                     "header('Content-Type: application/json'); "
+                     "echo json_encode(['admin'=>current_user_can('manage_options'), "
+                     "'edit_plugins'=>current_user_can('edit_plugins'), "
+                     "'edit_themes'=>current_user_can('edit_themes'), "
+                     "'edit_theme_options'=>current_user_can('edit_theme_options'), "
+                     "'install_plugins'=>current_user_can('install_plugins'), "
+                     "'update_plugins'=>current_user_can('update_plugins'), "
+                     "'install_themes'=>current_user_can('install_themes'), "
+                     "'update_themes'=>current_user_can('update_themes'), "
+                     "'file_edit_denied'=>defined('DISALLOW_FILE_EDIT') && (bool)DISALLOW_FILE_EDIT, "
+                     "'file_mods_denied'=>defined('DISALLOW_FILE_MODS') && (bool)DISALLOW_FILE_MODS]);")
+    probe.chmod(0o644)
+    expected = {'admin': True, 'edit_plugins': enabled, 'edit_themes': enabled,
+                'edit_theme_options': True,
+                'install_plugins': True, 'update_plugins': True,
+                'install_themes': True, 'update_themes': True,
+                'file_edit_denied': not enabled, 'file_mods_denied': False}
+    try:
+        # FPM may still hold the prior wp-config until OPcache's normal
+        # timestamp revalidation. No production settings or clocks change.
+        for _ in range(25):
+            status, _, body, code = request(site['primary'], '/wpi-ci-editor-caps.php')
+            values = json.loads(body) if status == 200 and code == 0 else {}
+            if values == expected:
+                return values
+            time.sleep(0.2)
+        raise AssertionError('Actual FPM administrator file-editor capabilities did not match policy: '
+                             + json.dumps(values))
+    finally:
+        probe.unlink(missing_ok=True)
+
+
+def verify_file_editor(site, peer):
+    """Toggle classic admin editors without changing plugin/theme files."""
+    site, peer = manager.site(site['id']), manager.site(peer['id'])
+    assert site['file_editor_enabled'] is False and peer['file_editor_enabled'] is False
+    status = manager.file_editor_status(site['id'])
+    assert status['enabled'] is False and status['managed_enabled'] is False
+    assert status['blocked_by_file_mods'] is False
+    file_editor_capabilities(site, False)
+    file_editor_capabilities(peer, False)
+    config = Path(site['root']) / 'wp-config.php'
+    marker = b"\n/* WPI CI opaque marker: '$HOME', \"quoted\", \\literal. */\n"
+    config.write_bytes(config.read_bytes() + marker)
+    names = ('DB_PASSWORD', 'AUTH_KEY', 'SECURE_AUTH_KEY', 'LOGGED_IN_KEY', 'NONCE_KEY',
+             'AUTH_SALT', 'SECURE_AUTH_SALT', 'LOGGED_IN_SALT', 'NONCE_SALT')
+    secrets_before = {name: manager.wp(site, 'config', 'get', name).stdout for name in names}
+    disabled_snapshot = manager.backup(site['id'])
+    peer_config = Path(peer['root']) / 'wp-config.php'
+    peer_bytes = peer_config.read_bytes()
+
+    # An existing broader file-modification policy wins. Enabling must refuse
+    # before writing config, metadata, or even a safety backup.
+    manager.wp(site, 'config', 'set', 'DISALLOW_FILE_MODS', 'true', '--raw')
+    blocked_config = config.read_bytes()
+    metadata = manager.data / 'sites' / (site['id'] + '.json')
+    blocked_metadata = metadata.read_bytes()
+    editor_backups = manager.data / 'file-editor-backups'
+    backup_paths = set(editor_backups.rglob('*'))
+    try:
+        assert manager.file_editor_status(site['id'])['blocked_by_file_mods'] is True
+        try:
+            manager.set_file_editor(site['id'], True)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('File editor enabling ignored DISALLOW_FILE_MODS.')
+        assert config.read_bytes() == blocked_config
+        assert metadata.read_bytes() == blocked_metadata
+        assert set(editor_backups.rglob('*')) == backup_paths
+    finally:
+        manager.wp(site, 'config', 'delete', 'DISALLOW_FILE_MODS')
+
+    baseline = config.read_bytes()
+    enabled = manager.set_file_editor(site['id'], True)
+    assert enabled['changed'] is True and enabled['enabled'] is True
+    assert enabled['managed_enabled'] is True
+    assert enabled.get('backup'), 'A file-editor config change lacks a safety backup.'
+    backup = Path(enabled['backup'])
+    if backup.is_dir():
+        backup = backup / 'wp-config.php'
+    assert backup.read_bytes() == baseline
+    assert backup.stat().st_mode & 0o777 == 0o600
+    assert backup.parent.stat().st_mode & 0o777 == 0o700
+    assert (backup.parent / 'site.json').read_bytes() == blocked_metadata
+    assert (backup.parent / 'site.json').stat().st_mode & 0o777 == 0o600
+    file_editor_capabilities(site, True)
+
+    # Authenticate the real WordPress administrator, storing disposable
+    # cookies privately. The login password goes through curl stdin only;
+    # editor requests are GET-only and never submit edited file content.
+    with tempfile.TemporaryDirectory(prefix='wpi-editor-login-ci-') as directory:
+        cookies = Path(directory) / 'cookies'
+        cookies.touch(mode=0o600)
+        base = ['curl', '--silent', '--show-error', '--insecure', '--noproxy', '*',
+                '--max-time', '30', '--resolve', f'{site["primary"]}:443:127.0.0.1',
+                '--cookie', str(cookies), '--cookie-jar', str(cookies),
+                '--dump-header', '-', '--write-out', '\nWPI_STATUS:%{http_code}\n']
+
+        def admin_request(path, login=None):
+            command = [*base]
+            if login is not None:
+                command += ['--header', 'Content-Type: application/x-www-form-urlencoded',
+                            '--data-binary', '@-']
+            result = subprocess.run([*command, 'https://' + site['primary'] + path],
+                                    input=login, text=True, capture_output=True, timeout=40)
+            http = re.search(r'WPI_STATUS:(\d+)', result.stdout)
+            assert result.returncode == 0 and http, 'WordPress admin HTTP request failed.'
+            return int(http[1]), result.stdout
+
+        assert admin_request('/wp-login.php')[0] == 200
+        login = urlencode({'log': site['admin'], 'pwd': 'CiWordPressPassword123!',
+                           'wp-submit': 'Log In', 'testcookie': '1',
+                           'redirect_to': 'https://' + site['primary'] + '/wp-admin/'})
+        login_status, login_response = admin_request('/wp-login.php', login)
+        cookies.chmod(0o600)
+        assert login_status == 302 and 'wordpress_logged_in_' in cookies.read_text(), \
+            'The actual WordPress administrator did not receive a login cookie.'
+        assert re.search(r'^location:\s*https://' + re.escape(site['primary']) + r'/wp-admin/',
+                         login_response, re.I | re.M), 'WordPress admin login redirect is unexpected.'
+        editors = ('/wp-admin/plugin-editor.php?plugin=redis-cache/redis-cache.php',
+                   '/wp-admin/theme-editor.php')
+        for path in editors:
+            http, body = admin_request(path)
+            assert http == 200 and 'name="newcontent"' in body and 'id="template"' in body, \
+                'Enabled classic WordPress editor did not render its file form.'
+        assert manager.set_file_editor(site['id'], False)['enabled'] is False
+        file_editor_capabilities(site, False)
+        for path in editors:
+            http, body = admin_request(path)
+            assert http in (403, 500) and 'name="newcontent"' not in body, \
+                'Disabled classic editor remained accessible to the administrator.'
+
+    assert peer_config.read_bytes() == peer_bytes
+    assert manager.site(peer['id'])['file_editor_enabled'] is False
+    file_editor_capabilities(peer, False)
+    for name, secret in secrets_before.items():
+        assert manager.wp(site, 'config', 'get', name).stdout == secret, name
+    assert marker in config.read_bytes(), 'Opaque wp-config content was changed by the toggle.'
+    manager.set_file_editor(site['id'], True)
+    enabled_config, enabled_metadata = config.read_bytes(), metadata.read_bytes()
+    assert manager.set_file_editor(site['id'], True)['changed'] is False
+    assert config.read_bytes() == enabled_config and metadata.read_bytes() == enabled_metadata
+    restored, _ = manager.restore(site['id'], disabled_snapshot)
+    assert restored['file_editor_enabled'] is True
+    assert manager.file_editor_status(site['id'])['enabled'] is True
+    file_editor_capabilities(restored, True)
+    assert marker in config.read_bytes()
+    assert peer_config.read_bytes() == peer_bytes
+    print('Actual WordPress administrator: classic plugin/theme editors render when enabled and deny '
+          'when disabled; plugin/theme install and update permissions remain; peer, private config '
+          'backup, opaque content and credentials preserved; broader file-mod policy refused; '
+          'enabled choice retained after restoring an older disabled snapshot.', flush=True)
+    return manager.site(site['id'])
+
+
 def verify_repair_and_php_settings(site):
     """Actual HTTP 500 recovery and runtime/upload settings through installed CLI."""
     root = Path(site['root'])
@@ -733,6 +896,8 @@ def verify_repair_and_php_settings(site):
     assert manager.wp(site, 'db', 'tables', '--all-tables-with-prefix').stdout == tables
     assert manager.file_hash(media) == media_hash
     assert request(site['primary'], '/wp-admin/')[0] in (200, 302)
+    assert manager.site(site['id'])['file_editor_enabled'] is True
+    file_editor_capabilities(site, True)
     print('Real HTTPS HTTP 500 from malformed wp-config recovered to HTTP 200; '
           'admin users, database content, media, and private broken-config backup preserved.', flush=True)
 
@@ -809,6 +974,7 @@ with mock.patch.object(core, 'check_dns', return_value=None), \
     verify_redirect(old, old, https=False)
     verify_real_fpm_congestion(site)
     cache_peer = verify_redis_cache(site)
+    site = verify_file_editor(site, cache_peer)
     verify_repair_and_php_settings(site)
 
     # A PHP array option is stored serialized by WordPress. The replacement
@@ -859,6 +1025,8 @@ with mock.patch.object(core, 'check_dns', return_value=None), \
     assert manager.wp(restored, 'option', 'get', 'siteurl').stdout.strip() == 'https://' + old
     assert expected_request(old, 200)[0] == 200
     restored = verify_runcloud_domains(restored, post)
+    assert restored['file_editor_enabled'] is True
+    file_editor_capabilities(restored, True)
     assert manager.wp(restored, 'eval', "echo wp_using_ext_object_cache() ? 'yes' : 'no';").stdout == 'yes'
     manager.wp(restored, 'cache', 'set', 'wpi-after-restore', 'restore-persistence', 'wpi_ci')
     assert cache_probe(restored, 'wpi-after-restore', 'restore-persistence')['matches'] is True
@@ -905,6 +1073,10 @@ with mock.patch.object(core, 'check_dns', return_value=None), \
         # config contents from the persistent state snapshots.
         print('Safe reinstall persistent-state path changes: ' + json.dumps(changed), flush=True)
     assert state_after == state_before, 'Application reinstall changed managed site state or credentials.'
+    assert manager.site(restored['id'])['file_editor_enabled'] is True
+    assert manager.site(cache_peer['id'])['file_editor_enabled'] is False
+    file_editor_capabilities(restored, True)
+    file_editor_capabilities(cache_peer, False)
     version = subprocess.run(['/usr/local/bin/wpi', '--version'], check=True, text=True, capture_output=True)
     assert version.stdout.strip() == os.environ['WPI_CI_VERSION']
     release_path = Path('/usr/local/lib/wpi').resolve()

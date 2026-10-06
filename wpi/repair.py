@@ -343,8 +343,11 @@ class SiteRepair:
         for key in ('WP_MEMORY_LIMIT', 'WP_MAX_MEMORY_LIMIT'):
             if fresh or self._has(site, candidate, key):
                 self._config_set(site, candidate, key, memory)
-        if fresh:
+        if 'file_editor_enabled' in site:
+            self.manager._site_file_editor_config(site, candidate=candidate)
+        elif fresh:
             self._config_set(site, candidate, 'DISALLOW_FILE_EDIT', 'true', raw=True)
+        if fresh:
             self._config_set(site, candidate, 'WP_AUTO_UPDATE_CORE', 'minor')
         if site.get('redis_cache', {}).get('enabled'):
             self.manager.redis.overlay_config(site, candidate=candidate)

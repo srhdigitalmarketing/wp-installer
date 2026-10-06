@@ -86,6 +86,15 @@ dipindahkan ke situs lain tidak boleh diaktifkan ulang oleh journal lama.
 
 ## Integrasi Ubuntu sekali pakai
 
+Editor file v1.7.0 diuji sebagai transaksi per situs: konstanta raw boolean,
+status config sebelum WordPress boot, blocker `DISALLOW_FILE_MODS`, idempotensi,
+rollback config/metadata, backup privat, dan penolakan path symlink. CLI status
+tetap tersedia saat kunci operasi dipegang; enable/disable memakai satu kunci.
+Fixture Ubuntu memeriksa capability administrator dari request PHP-FPM nyata
+dan akses HTTP terautentikasi ke kedua editor WordPress. Hak instalasi/update,
+kredensial dan situs kedua tetap sama. Pilihan editor bertahan saat restore
+snapshot lama, Repair config rusak, upgrade, dan migrasi SSH ke server tujuan.
+
 Unit repair memeriksa config rusak/hilang, snapshot dan checksum, pemulihan hanya
 config dari backup lama, prefix database yang diverifikasi, symlink, preservasi
 kredensial/domain, serta hasil unresolved untuk error plugin/theme. Diagnosis
